@@ -72,10 +72,19 @@ final class SaturatingMathTests: XCTestCase {
     func testLargePercentageDoesNotCollapseToOnePercent() {
         XCTAssertEqual(SaturatingMath.percentage(Int.max, of: Int.max), 100)
         XCTAssertEqual(SaturatingMath.percentage(Int.max, of: 4), 100)
+
+        // The `part >= total` shortcut alone does not save this one: `part < total`
+        // here, but `part * 100` still saturates, and dividing the saturated product
+        // by `total` reports 1% for what is 50%.
+        XCTAssertEqual(SaturatingMath.percentage(Int.max / 2, of: Int.max), 50)
+        XCTAssertEqual(SaturatingMath.percentage(Int.max / 4, of: Int.max), 25)
+
         let naiveSaturatedAnswer = SaturatingMath.divide(
-            SaturatingMath.multiply(Int.max, 100), by: Int.max
+            SaturatingMath.multiply(Int.max / 2, 100), by: Int.max
         )
         XCTAssertEqual(naiveSaturatedAnswer, 1, "the broken formula really does return 1%")
-        XCTAssertNotEqual(SaturatingMath.percentage(Int.max, of: Int.max), naiveSaturatedAnswer)
+        XCTAssertNotEqual(
+            SaturatingMath.percentage(Int.max / 2, of: Int.max), naiveSaturatedAnswer
+        )
     }
 }

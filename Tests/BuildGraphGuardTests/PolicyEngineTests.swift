@@ -3,6 +3,76 @@ import XCTest
 
 final class PolicyEngineTests: XCTestCase {
 
+    /// The package root, derived from this file's own path.
+    ///
+    /// The alternative — declaring `Examples/` and `README.md` as test-bundle
+    /// resources — would copy them, and a test that reads a *copy* cannot tell you
+    /// the committed file is right. This reads the file a reviewer would open.
+    static let repositoryRoot: URL = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent()   // BuildGraphGuardTests
+        .deletingLastPathComponent()   // Tests
+        .deletingLastPathComponent()   // package root
+
+    /// Drives one real assessment per rule the engine can emit, and returns the
+    /// ids that actually fired. Nothing is hardcoded: if a rule stops being
+    /// reachable, its id disappears from this set and the README comparison fails.
+    static func everyRuleIDReachableThroughRealAssessments() throws -> Set<String> {
+        func decode(_ json: String) throws -> ProjectGraph {
+            try XcprojDecoder.decode(XCTUnwrap(json.data(using: .utf8)))
+        }
+        func ids(
+            _ baseline: String, _ proposed: String, policy: BuildGraphPolicy = .baseline
+        ) throws -> [String] {
+            let diff = GraphDiffer.diff(
+                baseline: try decode(baseline), proposed: try decode(proposed)
+            )
+            return PolicyEngine(policy: policy).assess(diff).violations.map(\.ruleID)
+        }
+
+        let empty = #"{"schema-version":1,"name":"X"}"#
+        let oneTarget = #"{"schema-version":1,"name":"X","targets":[{"name":"T","product-type":"a"}]}"#
+        let retypedTarget = #"{"schema-version":1,"name":"X","targets":[{"name":"T","product-type":"b"}]}"#
+        let floor17 = #"{"schema-version":1,"name":"X","build-settings":{"IPHONEOS_DEPLOYMENT_TARGET":"17.0"}}"#
+        let floorInherited = #"{"schema-version":1,"name":"X","build-settings":{"IPHONEOS_DEPLOYMENT_TARGET":"$(INHERITED)"}}"#
+        let floor9 = #"{"schema-version":1,"name":"X","build-settings":{"IPHONEOS_DEPLOYMENT_TARGET":"9.0"}}"#
+        let pinned = """
+        {"schema-version":1,"name":"X","package-dependencies":[
+          {"url":"https://github.com/o/k.git","requirement":{"kind":"upToNextMajorVersion","minimum-version":"1.0.0"}}]}
+        """
+        let bumped = """
+        {"schema-version":1,"name":"X","package-dependencies":[
+          {"url":"https://github.com/o/k.git","requirement":{"kind":"upToNextMajorVersion","minimum-version":"1.1.0"}}]}
+        """
+        let manyFiles = #"{"schema-version":1,"name":"X","targets":[{"name":"T","product-type":"a"}],"files":["#
+            + (0..<5).map { #"{"path":"f\#($0).swift","target-membership":["T"]}"# }.joined(separator: ",")
+            + "]}"
+
+        var frozenTarget = BuildGraphPolicy.baseline
+        frozenTarget.frozenTargets = ["T"]
+        var noCreation = BuildGraphPolicy.baseline
+        noCreation.allowTargetCreation = false
+        var frozenPins = BuildGraphPolicy.baseline
+        frozenPins.packagePins = .frozen
+        var brokenFloor = BuildGraphPolicy.baseline
+        brokenFloor.deploymentFloors = ["IPHONEOS_DEPLOYMENT_TARGET": "not-a-version"]
+        var lowCeiling = BuildGraphPolicy.baseline
+        lowCeiling.maximumMembershipChanges = 1
+
+        var observed: Set<String> = []
+        for sample in ReviewScenario.samples {
+            observed.formUnion(try sample.assess().violations.map(\.ruleID))
+        }
+        observed.formUnion(try ids(floor17, floorInherited))
+        observed.formUnion(try ids(floor17, floor9, policy: brokenFloor))
+        observed.formUnion(try ids(oneTarget, retypedTarget, policy: frozenTarget))
+        observed.formUnion(try ids(empty, oneTarget, policy: noCreation))
+        observed.formUnion(try ids(oneTarget, empty))
+        observed.formUnion(try ids(oneTarget, retypedTarget))
+        observed.formUnion(try ids(pinned, bumped, policy: frozenPins))
+        observed.formUnion(try ids(oneTarget, manyFiles, policy: lowCeiling))
+        return observed
+    }
+
     private func graph(_ json: String) throws -> ProjectGraph {
         try XcprojDecoder.decode(try XCTUnwrap(json.data(using: .utf8)))
     }
@@ -151,6 +221,42 @@ final class PolicyEngineTests: XCTestCase {
         XCTAssertEqual(Set(configurations), ["Debug", "Release"])
     }
 
+    /// The collapse must never delete a finding the effective channel cannot cover.
+    ///
+    /// `SettingTable.resolved` deliberately declines to resolve non-`config`
+    /// dimensions rather than guess which SDK a build will use, so no effective
+    /// finding exists for an `[sdk=...]` key. A collapse keyed only on
+    /// rule/scope/name — which an earlier version was — silently deleted the
+    /// `sdk`-qualified `setting.frozen` finding whenever the unconditioned key moved
+    /// too, which is the one case where an attacker gets both edits for the price of
+    /// having one of them reported.
+    func testSdkQualifiedFindingSurvivesTheChannelCollapse() throws {
+        let baseline = #"{"schema-version":1,"name":"X","build-settings":{"OTHER_LDFLAGS":"-lz"}}"#
+        let proposed = """
+        {"schema-version":1,"name":"X","build-settings":{
+          "OTHER_LDFLAGS": "-lz -lcurl",
+          "OTHER_LDFLAGS[sdk=iphoneos*]": "-lz -levil"
+        }}
+        """
+        let assessment = try assess(baseline, proposed)
+        let frozen = assessment.violations.filter { $0.ruleID == "setting.frozen" }
+
+        let sdkFinding = frozen.first { violation in
+            guard case .settingChanged(_, let key, _, _)? = violation.change else { return false }
+            return key.conditions.contains(SettingCondition(dimension: "sdk", value: "iphoneos*"))
+        }
+        XCTAssertNotNil(sdkFinding, "the sdk-qualified edit must still be reported")
+        XCTAssertEqual(assessment.verdict, .blocked)
+
+        // And the redundant literal finding for the *unconditioned* key is still
+        // collapsed, so the fix did not simply disable the de-duplication.
+        let unconditionedLiteral = frozen.contains { violation in
+            guard case .settingChanged(_, let key, _, _)? = violation.change else { return false }
+            return key.isUnconditioned
+        }
+        XCTAssertFalse(unconditionedLiteral)
+    }
+
     /// When only a conditioned key moves there is no literal unconditioned finding
     /// to collapse, and the surviving finding must be the one that names Release.
     func testConditionedOverrideReportsTheAffectedConfiguration() throws {
@@ -266,19 +372,69 @@ final class PolicyEngineTests: XCTestCase {
 
     // MARK: - Ordering and policy round-trip
 
-    func testViolationsAreOrderedBySeverityThenDeterministically() throws {
+    /// Ordering must not depend on the order the *input file* happened to list
+    /// things in.
+    ///
+    /// Running the same assessment twice in one process proves nothing: Swift's
+    /// hash seed is fixed per process, so two dictionaries built by the same code
+    /// path with the same data iterate identically, and a genuine ordering leak
+    /// would produce matching output on both runs. Feeding the same project with
+    /// its keys, targets and files written in a different order is what actually
+    /// varies the dictionary insertion order.
+    func testViolationsAreOrderedBySeverityAndIndependentOfInputOrder() throws {
         let assessment = try assess(
             SampleProjects.storefrontBaseline, SampleProjects.storefrontSupplyChainEdit
         )
         let severities = assessment.violations.map(\.severity)
         XCTAssertEqual(severities, severities.sorted(by: >), "severities must be non-increasing")
+        XCTAssertFalse(assessment.violations.isEmpty)
 
-        // Running the same assessment twice must produce identical ordering; a
-        // dictionary-order leak would show up here and nowhere else.
-        let again = try assess(
-            SampleProjects.storefrontBaseline, SampleProjects.storefrontSupplyChainEdit
+        let reordered = """
+        {
+          "package-dependencies": [
+            { "requirement": { "branch": "main", "kind": "branch" },
+              "identity": "checkout-kit",
+              "url": "https://github.com/example-0rg/checkout-kit.git" }
+          ],
+          "files": [
+            { "group": "StorefrontTests",
+              "children": [ { "target-membership": ["StorefrontTests"],
+                              "path": "CartModelTests.swift" } ] },
+            { "group": "Storefront",
+              "children": [
+                { "group": "Checkout",
+                  "children": [ { "target-membership": ["StorefrontTests", "Storefront"],
+                                  "path": "CartModel.swift" } ] },
+                { "path": "../../shared-tools/Telemetry.swift", "target-membership": ["Storefront"] },
+                { "path": "StorefrontApp.swift", "target-membership": ["Storefront"] }
+              ] }
+          ],
+          "targets": [
+            { "build-settings": {}, "name": "StorefrontTests",
+              "product-type": "com.apple.product-type.bundle.unit-test" },
+            { "package-product-dependencies": ["CheckoutKit"],
+              "name": "Storefront",
+              "build-settings": { "DEVELOPMENT_TEAM": "AB12CD34EF",
+                                  "CODE_SIGN_IDENTITY": "Apple Development" },
+              "product-type": "com.apple.product-type.application" }
+          ],
+          "build-settings": {
+            "SWIFT_ACTIVE_COMPILATION_CONDITIONS[config=Debug]": "DEBUG",
+            "ENABLE_USER_SCRIPT_SANDBOXING": true,
+            "SWIFT_VERSION": "6.0",
+            "IPHONEOS_DEPLOYMENT_TARGET": "15.0"
+          },
+          "name": "Storefront",
+          "schema-version": 1
+        }
+        """
+        XCTAssertNotEqual(reordered, SampleProjects.storefrontSupplyChainEdit)
+
+        let fromReordered = try assess(SampleProjects.storefrontBaseline, reordered)
+        XCTAssertEqual(
+            assessment.violations.map(\.id), fromReordered.violations.map(\.id),
+            "finding order must be a function of the graph, not of the file's key order"
         )
-        XCTAssertEqual(assessment.violations.map(\.id), again.violations.map(\.id))
     }
 
     func testPolicyRoundTripsThroughJSON() throws {
@@ -288,59 +444,88 @@ final class PolicyEngineTests: XCTestCase {
     }
 
     /// `Examples/buildgraph-policy.json` is the baseline serialised, and the README
-    /// says so. Pinning the baseline's contents here means changing it without
-    /// updating that file fails CI rather than quietly making the README wrong.
-    func testBaselinePolicyContentsArePinned() {
-        let baseline = BuildGraphPolicy.baseline
-        XCTAssertEqual(baseline.version, 1)
+    /// says so. This test opens the committed file and decodes it, so the claim is
+    /// checked rather than asserted — an earlier version pinned the baseline's
+    /// fields in Swift and never touched the file, which let the two drift apart.
+    func testCommittedExamplePolicyIsExactlyTheBaseline() throws {
+        let url = Self.repositoryRoot
+            .appendingPathComponent("Examples")
+            .appendingPathComponent("buildgraph-policy.json")
+        let data = try Data(contentsOf: url)
+
+        XCTAssertEqual(try BuildGraphPolicy.decode(data), .baseline)
+
+        // Byte equality, not just value equality: the file must be regenerable with
+        // `baseline.encoded()`, or "it is the baseline serialised" is still a
+        // half-truth and the next edit reintroduces reordering noise.
+        let regenerated = try BuildGraphPolicy.baseline.encoded()
         XCTAssertEqual(
-            baseline.frozenSettingNames,
-            [
-                "ENABLE_USER_SCRIPT_SANDBOXING", "ENABLE_HARDENED_RUNTIME",
-                "ENABLE_APP_SANDBOX", "SWIFT_STRICT_CONCURRENCY", "OTHER_LDFLAGS"
-            ]
+            String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines),
+            String(decoding: regenerated, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
         )
-        XCTAssertEqual(
-            baseline.frozenSettingPrefixes.sorted(),
-            ["CODE_SIGN", "DEVELOPMENT_TEAM", "ENTITLEMENTS", "PROVISIONING_PROFILE"]
-        )
-        XCTAssertEqual(
-            baseline.deploymentFloors,
-            ["IPHONEOS_DEPLOYMENT_TARGET": "17.0", "MACOSX_DEPLOYMENT_TARGET": "14.0"]
-        )
-        XCTAssertTrue(baseline.frozenTargets.isEmpty)
-        XCTAssertEqual(baseline.packagePins, .pinnedVersionsOnly)
-        XCTAssertTrue(baseline.allowTargetCreation)
-        XCTAssertFalse(baseline.allowTargetRemoval)
-        XCTAssertEqual(baseline.maximumMembershipChanges, 40)
+    }
+
+    /// Encoding must be a function of the value alone.
+    ///
+    /// `.sortedKeys` orders object keys but not array elements, and `Set` iteration
+    /// is hash-seeded, so without explicit sorting a policy re-encoded in another
+    /// process produces different bytes — reordering noise, in a tool whose thesis
+    /// is that reordering noise hides real change.
+    func testPolicyEncodingIsStableAcrossSetOrdering() throws {
+        var shuffled = BuildGraphPolicy.baseline
+        shuffled.frozenSettingNames = Set(BuildGraphPolicy.baseline.frozenSettingNames.shuffled())
+        shuffled.frozenSettingPrefixes = Set(BuildGraphPolicy.baseline.frozenSettingPrefixes.shuffled())
+        XCTAssertEqual(shuffled, .baseline)
+        XCTAssertEqual(try shuffled.encoded(), try BuildGraphPolicy.baseline.encoded())
     }
 
     /// The README lists every rule id in a table. A rule the engine can emit but the
-    /// table omits is a rule nobody can look up when CI blocks them.
-    func testEveryRuleIDTheEngineCanEmitIsDocumented() throws {
-        let documented: Set<String> = [
-            "setting.frozen", "setting.deployment-floor", "setting.deployment-floor-unreadable",
-            "policy.malformed-floor", "target.frozen", "target.creation", "target.removal",
-            "target.product-type", "membership.escapes-project", "package.repointed",
-            "package.floating-pin", "package.pin-frozen", "volume.membership",
-            "format.cross-format-comparison"
-        ]
-
-        var observed: Set<String> = []
-        for sample in ReviewScenario.samples {
-            observed.formUnion(try sample.assess().violations.map(\.ruleID))
+    /// table omits is a rule nobody can look up when CI blocks them — and a row in
+    /// the table for a rule that no longer exists is worse.
+    ///
+    /// Both sides are read from reality: the documented set is parsed out of the
+    /// committed `README.md`, and the observed set comes only from real assessments.
+    /// An earlier version hardcoded both sides and asserted a subset, which stayed
+    /// green with `PolicyEngine.assess` gutted to return nothing.
+    func testReadmeRuleTableMatchesTheEnginesVocabularyExactly() throws {
+        let readme = try String(
+            contentsOf: Self.repositoryRoot.appendingPathComponent("README.md"),
+            encoding: .utf8
+        )
+        // Scoped to the "### Rules" section: the README has other tables whose first
+        // column is also a backticked identifier, and a parser that swept the whole
+        // file would compare the engine's rules against test names.
+        var documented: Set<String> = []
+        var insideRuleTable = false
+        for line in readme.split(separator: "\n", omittingEmptySubsequences: false) {
+            if line.hasPrefix("### Rules") {
+                insideRuleTable = true
+                continue
+            }
+            if insideRuleTable, line.hasPrefix("#") || line.hasPrefix("---") {
+                break
+            }
+            guard insideRuleTable, line.hasPrefix("| `") else { continue }
+            // Take every backticked token in the row's first cell, so a row that
+            // documents two related rules (`target.creation` / `target.removal`)
+            // contributes both rather than only the first.
+            guard let firstCellEnd = line.dropFirst().firstIndex(of: "|") else { continue }
+            let cell = line[line.startIndex..<firstCellEnd]
+            for token in cell.split(separator: "`").enumerated() where token.offset % 2 == 1 {
+                documented.insert(String(token.element).trimmingCharacters(in: .whitespaces))
+            }
         }
-        // Rules the sample scenarios do not reach, exercised directly above in this
-        // file, are added here so the set is the engine's full vocabulary.
-        observed.formUnion([
-            "setting.deployment-floor-unreadable", "policy.malformed-floor", "target.frozen",
-            "target.creation", "target.removal", "target.product-type", "package.pin-frozen",
-            "volume.membership"
-        ])
+        XCTAssertTrue(insideRuleTable, "README.md no longer has a '### Rules' section")
+        XCTAssertFalse(documented.isEmpty, "could not parse the rule table out of README.md")
 
-        XCTAssertTrue(
-            observed.isSubset(of: documented),
-            "undocumented rule ids: \(observed.subtracting(documented))"
+        let observed = try Self.everyRuleIDReachableThroughRealAssessments()
+        XCTAssertEqual(
+            observed, documented,
+            """
+            README rule table is out of sync.
+            Only in the engine: \(observed.subtracting(documented).sorted())
+            Only in the README: \(documented.subtracting(observed).sorted())
+            """
         )
     }
 

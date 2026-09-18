@@ -58,25 +58,38 @@ final class OpenStepPlistTests: XCTestCase {
         XCTAssertThrowsError(try OpenStepPlist.parse(text))
     }
 
-    /// Every truncation of a real file must either parse or throw — never trap.
+    /// **Every** truncation of a real file must be rejected — never trap, and never
+    /// be mistaken for a valid project.
     ///
     /// This is the test that earns the hand-written scanner. A parser reached by a
     /// gate runs on whatever is on the branch, including a file a crashed merge left
     /// half-written, and a trap there takes CI down rather than rejecting the commit.
-    func testEveryTruncationOfARealFileIsHandled() {
-        let full = SampleProjects.storefrontLegacy
-        let characters = Array(full)
+    ///
+    /// The assertion is on `PbxprojBridge.decode`, not on `OpenStepPlist.parse`, and
+    /// that is deliberate rather than a weakening. A one-character prefix of this
+    /// fixture is `/`, which is a perfectly legal *bare token* in the OpenStep
+    /// dialect, so demanding that the scanner reject it would be demanding wrong
+    /// behaviour. What must never happen is that a truncated file yields a usable
+    /// build graph — that is what this asserts, for all ~5,000 prefixes.
+    ///
+    /// An earlier draft wrote `_ = try? OpenStepPlist.parse(prefix)` with no
+    /// assertion at all; a `parse` gutted to `return .string("")` would have kept it
+    /// green, and the README nonetheless claimed it proved "throws rather than traps".
+    func testEveryTruncationOfARealFileIsRejected() throws {
+        let characters = Array(SampleProjects.storefrontLegacy)
         XCTAssertGreaterThan(characters.count, 1_000, "fixture should be substantial")
 
-        // Step through the file rather than testing all ~4,000 prefixes, which would
-        // be the same assertion 4,000 times at 4,000 times the runtime.
-        var prefixLength = 0
-        while prefixLength < characters.count {
+        for prefixLength in 0..<characters.count {
             let prefix = String(characters[0..<prefixLength])
-            // The only requirement is "does not trap"; either outcome is acceptable.
-            _ = try? OpenStepPlist.parse(prefix)
-            prefixLength = min(characters.count, prefixLength + 17)
+            XCTAssertThrowsError(
+                try PbxprojBridge.decode(prefix),
+                "prefix of length \(prefixLength) produced a build graph"
+            )
         }
+
+        // The untruncated file must still decode, or the loop above would be
+        // satisfied by a bridge that rejects everything.
+        XCTAssertNoThrow(try PbxprojBridge.decode(SampleProjects.storefrontLegacy))
     }
 
     func testEmptyAndWhitespaceOnlyInputThrow() {
@@ -211,8 +224,33 @@ final class PbxprojBridgeTests: XCTestCase {
         XCTAssertTrue(graph.targets.isEmpty)
     }
 
-    func testCoverageIsDeclaredNotImplied() {
-        XCTAssertFalse(PbxprojBridge.BridgeCoverage.modelled.isEmpty)
-        XCTAssertFalse(PbxprojBridge.BridgeCoverage.notModelled.isEmpty)
+    /// The bridge's declared coverage has to reach the reviewer, not just the
+    /// source file. A previous version of this test asserted only that the two
+    /// arrays were non-empty — a tautology over two literals that passed with the
+    /// whole bridge gutted. This asserts the advisory a reviewer actually reads
+    /// names both halves.
+    func testCoverageLimitsReachTheAdvisoryAReviewerSees() throws {
+        let legacy = try PbxprojBridge.decode(SampleProjects.storefrontLegacy)
+        let modern = try XcprojDecoder.decode(
+            try XCTUnwrap(SampleProjects.storefrontBaseline.data(using: .utf8))
+        )
+        let assessment = PolicyEngine().assess(
+            GraphDiffer.diff(baseline: legacy, proposed: modern)
+        )
+        let advisory = try XCTUnwrap(
+            assessment.violations.first { $0.ruleID == "format.cross-format-comparison" }
+        )
+        for item in PbxprojBridge.BridgeCoverage.notModelled {
+            XCTAssertTrue(
+                advisory.explanation.contains(item),
+                "advisory does not mention the unmodelled field '\(item)'"
+            )
+        }
+        for item in PbxprojBridge.BridgeCoverage.modelled {
+            XCTAssertTrue(
+                advisory.explanation.contains(item),
+                "advisory does not mention the modelled field '\(item)'"
+            )
+        }
     }
 }

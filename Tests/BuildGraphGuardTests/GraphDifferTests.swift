@@ -125,40 +125,41 @@ final class GraphDifferTests: XCTestCase {
         XCTAssertEqual(diff.proposedOrigin, .xcproj(schemaVersion: 1))
     }
 
-    /// A projection that skipped hoisting really would produce a wall of noise —
-    /// asserted directly so the previous test's `isEmpty` is known to be earned.
+    /// The hoist is what earns the previous test's `isEmpty`, and this proves it by
+    /// running the **real bridge with hoisting switched off** rather than by
+    /// rebuilding an un-hoisted table inline.
+    ///
+    /// The distinction matters: an inline reconstruction asserts that the test's own
+    /// arithmetic works and would keep passing if `PbxprojBridge.settings` lost its
+    /// hoist entirely. This version calls the production code path, so deleting the
+    /// hoist makes `testCrossFormatMigrationProducesNoStructuralChanges` fail and
+    /// this test's `XCTAssertNotEqual` fail too — which is the point of having both.
     func testWithoutHoistingTheSameMigrationWouldBeNoisy() throws {
         let modern = try graph(SampleProjects.storefrontBaseline)
 
-        // Rebuild the legacy graph the way a naive projection would: every setting
-        // duplicated per configuration, none hoisted.
-        var naive = SettingTable()
-        for configuration in ["Debug", "Release"] {
-            for key in modern.projectSettings.sortedKeys where key.isUnconditioned {
-                guard let value = modern.projectSettings[key] else { continue }
-                naive.set(
-                    value,
-                    for: SettingKey(
-                        name: key.name,
-                        conditions: [SettingCondition(dimension: "config", value: configuration)]
-                    )
-                )
-            }
-        }
-        let naiveGraph = ProjectGraph(
-            origin: .pbxproj(objectVersion: 56),
-            name: modern.name,
-            targets: modern.targets,
-            projectSettings: naive,
-            packages: modern.packages
+        let hoisted = try PbxprojBridge.decode(SampleProjects.storefrontLegacy)
+        let unhoisted = try PbxprojBridge.decode(
+            SampleProjects.storefrontLegacy, hoistUniformSettings: false
+        )
+        XCTAssertNotEqual(
+            hoisted.projectSettings, unhoisted.projectSettings,
+            "the flag must actually change the projection, or this test proves nothing"
         )
 
-        let noisy = GraphDiffer.diff(baseline: naiveGraph, proposed: modern)
+        let quiet = GraphDiffer.diff(baseline: hoisted, proposed: modern)
+        let noisy = GraphDiffer.diff(baseline: unhoisted, proposed: modern)
+
+        XCTAssertTrue(quiet.isEmpty)
         XCTAssertFalse(noisy.isEmpty)
-        XCTAssertGreaterThanOrEqual(
-            noisy.changes.count, 6,
-            "an unhoisted projection should report every uniform setting twice over"
-        )
+
+        // Every setting that is uniform across Debug and Release in the legacy file
+        // — SWIFT_VERSION, IPHONEOS_DEPLOYMENT_TARGET, ENABLE_USER_SCRIPT_SANDBOXING,
+        // CODE_SIGN_IDENTITY, DEVELOPMENT_TEAM — appears as a spurious change.
+        let spuriousNames = Set(noisy.changes.compactMap(\.settingName))
+        XCTAssertTrue(spuriousNames.contains("SWIFT_VERSION"), "got \(spuriousNames.sorted())")
+        XCTAssertTrue(spuriousNames.contains("IPHONEOS_DEPLOYMENT_TARGET"))
+        XCTAssertTrue(spuriousNames.contains("ENABLE_USER_SCRIPT_SANDBOXING"))
+        XCTAssertTrue(spuriousNames.contains("CODE_SIGN_IDENTITY"))
     }
 
     // MARK: - Change coverage
@@ -246,14 +247,51 @@ final class GraphDifferTests: XCTestCase {
 
 final class GraphCanonicalizerTests: XCTestCase {
 
-    func testCanonicalizationIsIdempotent() throws {
-        let graph = try XcprojDecoder.decode(
-            try XCTUnwrap(SampleProjects.storefrontBaseline.data(using: .utf8))
+    /// Idempotence asserted on a *deliberately non-canonical* input.
+    ///
+    /// Run on an already-canonical graph, `canonicalize(canonicalize(x)) ==
+    /// canonicalize(x)` is satisfied by the identity function and proves nothing.
+    /// Starting from unsorted, duplicated, `.git`-suffixed input forces the first
+    /// application to change something — asserted explicitly — before the second is
+    /// required to change nothing.
+    func testCanonicalizationIsIdempotentStartingFromMessyInput() {
+        let messy = ProjectGraph(
+            origin: .xcproj(schemaVersion: 1),
+            name: "X",
+            targets: [
+                TargetNode(
+                    name: "Zeta", productType: "p",
+                    membership: ["b/./x.swift", "a.swift", "b/x.swift"],
+                    packageProducts: ["Two", "One", "Two"]
+                ),
+                TargetNode(name: "Alpha", productType: "p", membership: ["./c.swift"])
+            ],
+            packages: [
+                PackageDependency(
+                    identity: "ZED", url: "https://example.com/z.git/",
+                    requirement: .exact("1.0.0")
+                ),
+                PackageDependency(
+                    identity: "ACE", url: "https://example.com/a",
+                    requirement: .exact("2.0.0")
+                )
+            ]
         )
-        let once = GraphCanonicalizer.canonicalize(graph)
+        XCTAssertFalse(
+            GraphCanonicalizer.isCanonical(messy),
+            "the input must be non-canonical or this test is satisfied by the identity function"
+        )
+
+        let once = GraphCanonicalizer.canonicalize(messy)
+        XCTAssertNotEqual(once, messy, "the first application must actually change something")
+
         let twice = GraphCanonicalizer.canonicalize(once)
         XCTAssertEqual(once, twice)
         XCTAssertTrue(GraphCanonicalizer.isCanonical(once))
+
+        XCTAssertEqual(once.targets.map(\.name), ["Alpha", "Zeta"])
+        XCTAssertEqual(once.packages.map(\.identity), ["ace", "zed"])
+        XCTAssertEqual(once.packages.map(\.url), ["https://example.com/a", "https://example.com/z"])
     }
 
     func testCanonicalizationSortsAndDeduplicates() {

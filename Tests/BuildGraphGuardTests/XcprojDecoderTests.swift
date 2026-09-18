@@ -118,11 +118,9 @@ final class XcprojDecoderTests: XCTestCase {
     }
 
     /// The tree is walked with an explicit stack precisely so this throws instead of
-    /// overflowing the call stack. A stack overflow is uncatchable; a thrown error
-    /// tells the reviewer which file to look at.
-    /// The tree is walked with an explicit stack precisely so this throws instead of
-    /// overflowing the call stack. Both sides of the boundary are asserted, so a
-    /// limit that is off by one — or absent — fails rather than passing by accident.
+    /// overflowing the call stack — a stack overflow is uncatchable, a thrown error
+    /// names the file. Both sides of the boundary are asserted, so a limit that is
+    /// off by one, or absent, fails rather than passing by accident.
     func testDepthCeilingIsEnforcedAtExactlyTheStatedBoundary() throws {
         let limits = XcprojDecoder.DecodingLimits(maximumTreeDepth: 8, maximumTreeNodes: 1_000)
 
@@ -237,11 +235,21 @@ final class JSONValueTests: XCTestCase {
         XCTAssertEqual(JSONValue.string("YES").settingValue, .boolean(true))
     }
 
-    /// `SWIFT_VERSION: 6.0` as a JSON number and `"6.0"` as a JSON string are the
-    /// same setting; rendering the number as `6.0` rather than `6` keeps them equal.
-    func testNumbersRenderWithoutExponentOrSpuriousDecimal() {
-        XCTAssertEqual(JSONValue.number(6.0).settingValue, .string("6"))
+    /// `IPHONEOS_DEPLOYMENT_TARGET: 17.0` as a JSON number and `"17.0"` as a JSON
+    /// string are the same setting, and must canonicalise to the same value.
+    ///
+    /// An earlier version collapsed integral doubles to `Int`, so `17.0` became
+    /// `"17"` and diffed against `"17.0"` on every single run — exactly the
+    /// migration-day noise this library exists to suppress. The assertion below is
+    /// the regression test for that, which is why it compares against the string
+    /// spelling rather than against a hand-written expectation.
+    func testIntegralJSONNumbersKeepTheirDecimalSpelling() {
+        XCTAssertEqual(
+            JSONValue.number(17.0).settingValue,
+            SettingValue.string("17.0").canonicalized
+        )
         XCTAssertEqual(JSONValue.number(6.5).settingValue, .string("6.5"))
+        // A JSON integer has no decimal spelling to preserve.
         XCTAssertEqual(JSONValue.integer(17).settingValue, .string("17"))
     }
 }

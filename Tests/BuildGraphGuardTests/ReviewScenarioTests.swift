@@ -2,9 +2,8 @@ import XCTest
 @testable import BuildGraphGuard
 
 /// The demo app renders exactly these scenarios. Asserting their outcomes here is
-/// what keeps the screenshots honest: if a scenario stops producing the finding its
-/// title advertises, CI fails rather than the app quietly becoming a picture of an
-/// empty list.
+/// what keeps the demo honest: if a scenario stops producing the finding its title
+/// advertises, CI fails rather than the app quietly rendering an empty list.
 final class ReviewScenarioTests: XCTestCase {
 
     private func scenario(_ id: String) throws -> ReviewScenario {
