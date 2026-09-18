@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    name: Linux — build (warnings as errors) + test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: swift-actions/setup-swift@v2
+        with:
+          swift-version: "6.0"
+
+      - name: Swift version
+        run: swift --version
+
+      - name: Build with warnings as errors
+        # A warning nobody fails on is a warning that accumulates. The flag lives
+        # here rather than in Package.swift so consumers of the package are not
+        # forced into it by a transitive dependency.
+        run: swift build -Xswiftc -warnings-as-errors
+
+      - name: Test
+        run: swift test
+
+  apple:
+    name: macOS — test + build for iOS Simulator
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Swift version
+        run: swift --version
+
+      - name: Test on macOS
+        run: swift test
+
+      - name: List generated schemes
+        run: xcodebuild -list
+
+      # The Linux job cannot compile BuildGraphGuardUI: its sources sit behind
+      # `#if canImport(SwiftUI)`, so on Linux they compile to nothing and a green
+      # Linux run says nothing at all about the view layer. This step is what
+      # actually type-checks it against the iOS SDK.
+      #
+      # `generic/platform=iOS Simulator` on purpose: a named device ties the job to
+      # whichever simulator runtimes happen to be installed on that day's runner
+      # image, and a compile-only check needs no device to exist.
+      - name: Build BuildGraphGuardUI for iOS Simulator
+        run: |
+          xcodebuild build \
+            -scheme BuildGraphGuardUI \
+            -destination 'generic/platform=iOS Simulator'
