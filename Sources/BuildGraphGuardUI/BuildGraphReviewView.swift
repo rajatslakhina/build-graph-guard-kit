@@ -145,15 +145,23 @@ public struct BuildGraphReviewView: View {
         }
     }
 
+    /// Counts every severity, advisories included.
+    ///
+    /// Omitting advisories here produced a screen that said "no findings" directly
+    /// above a section headed "Policy findings" with an advisory row in it — on the
+    /// migration scenario, which is the one where the advisory is the whole point.
     private func countsLine(_ assessment: PolicyAssessment) -> String {
         let changeCount = assessment.diff.changes.count
         let blockingCount = assessment.blockingViolations.count
         let warningCount = assessment.warnings.count
+        let advisoryCount = assessment.advisories.count
         let changes = "\(changeCount) semantic change\(changeCount == 1 ? "" : "s")"
-        guard blockingCount > 0 || warningCount > 0 else { return "\(changes), no findings" }
+
         var parts: [String] = []
         if blockingCount > 0 { parts.append("\(blockingCount) blocking") }
         if warningCount > 0 { parts.append("\(warningCount) warning\(warningCount == 1 ? "" : "s")") }
+        if advisoryCount > 0 { parts.append("\(advisoryCount) advisory") }
+        guard !parts.isEmpty else { return "\(changes), no findings" }
         return "\(changes), " + parts.joined(separator: ", ")
     }
 
