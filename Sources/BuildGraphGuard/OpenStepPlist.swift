@@ -69,8 +69,10 @@ public enum OpenStepPlist {
 
         var isAtEnd: Bool { offset >= bytes.count }
 
-        /// The byte at the cursor, or `nil` at end of input. Every read in this
-        /// parser goes through here, so there is no unchecked subscript anywhere.
+        /// The byte at the cursor, or `nil` at end of input. Every *cursor* read goes
+        /// through here; the one range read, in `parseBareString`, is guarded at both
+        /// ends (`offset > start` and `start < bytes.count`). There is no unchecked
+        /// subscript in either path.
         func peek(_ lookahead: Int = 0) -> UInt8? {
             let index = SaturatingMath.add(offset, lookahead)
             guard index >= 0, index < bytes.count else { return nil }
@@ -153,7 +155,13 @@ public enum OpenStepPlist {
                 let value = try parseValue(depth: SaturatingMath.add(depth, 1))
                 fields[key] = value
                 try skipTrivia()
-                // The separator is optional before a closing brace in the wild.
+                // The separator is treated as optional everywhere, not only before a
+                // closing brace, so `{ a = 1 b = 2 }` parses. Xcode always writes the
+                // `;`, but hand-edited and tool-merged files in the wild sometimes do
+                // not, and this reader's job is to recover a build graph from a branch
+                // rather than to grade its punctuation. (The *format* checks that must
+                // not guess — schema version, node shape, requirement kind — all still
+                // refuse rather than default.)
                 if peek() == 0x3B { advance() } // ;
             }
         }
@@ -174,6 +182,7 @@ public enum OpenStepPlist {
                 }
                 items.append(try parseValue(depth: SaturatingMath.add(depth, 1)))
                 try skipTrivia()
+                // Optional everywhere, for the same reason as `;` above.
                 if peek() == 0x2C { advance() } // ,
             }
         }

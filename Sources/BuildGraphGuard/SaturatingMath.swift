@@ -29,8 +29,10 @@ public enum SaturatingMath {
         return isNegative ? Int.min : Int.max
     }
 
-    /// `numerator / denominator`, returning `fallback` for the two cases Swift traps on:
-    /// division by zero, and `Int.min / -1` (whose true value is not representable).
+    /// `numerator / denominator`, handling the two cases Swift traps on: division by
+    /// zero returns `fallback`, and `Int.min / -1` returns `Int.max` — its true value
+    /// is `2^63`, exactly one past the representable range, so saturating is closer
+    /// to the answer than any caller-supplied default would be.
     public static func divide(_ numerator: Int, by denominator: Int, fallback: Int = 0) -> Int {
         guard denominator != 0 else { return fallback }
         guard !(numerator == Int.min && denominator == -1) else { return Int.max }
@@ -108,6 +110,23 @@ public struct DottedVersion: Comparable, Hashable, Sendable, CustomStringConvert
         }
         self.components = parsed
         self.description = trimmed
+    }
+
+    /// The canonical spelling: trailing zero components removed, so `17`, `17.0` and
+    /// `17.0.0` all render as `17`.
+    ///
+    /// This is what lets a version-valued setting written as the JSON *number* `17.0`
+    /// and the JSON *string* `"17.0"` compare equal. `Decodable` cannot recover which
+    /// of `17` and `17.0` was in the file — Foundation decodes both to `Int(17)` —
+    /// so no amount of care at the decoding layer can distinguish them, and the only
+    /// honest fix is to make the distinction not matter for the settings where it
+    /// carries no meaning. See `SettingTable.versionValuedSettingNames`.
+    public var canonicalSpelling: String {
+        var significant = components
+        while significant.count > 1, significant.last == 0 {
+            significant.removeLast()
+        }
+        return significant.map(String.init).joined(separator: ".")
     }
 
     public static func < (lhs: DottedVersion, rhs: DottedVersion) -> Bool {

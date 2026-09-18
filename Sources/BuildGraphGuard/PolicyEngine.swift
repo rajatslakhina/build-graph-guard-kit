@@ -225,9 +225,14 @@ public struct PolicyEngine: Sendable {
     /// to 15.0 and Release dropping to 14.0 are two different problems.
     func collapsingRedundantChannels(_ violations: [PolicyViolation]) -> [PolicyViolation] {
         /// (rule, scope, name, configuration-or-nil) → the resulting values reported.
+        ///
+        /// `scope` is the `SettingScope` itself, not its `displayName`: that string
+        /// renders `.project` as `"project"`, so a target actually named `project`
+        /// would share a bucket with project scope and could have a real finding
+        /// collapsed against an unrelated one on the other side.
         struct Coverage: Hashable {
             let ruleID: String
-            let scope: String
+            let scope: GraphChange.SettingScope
             let name: String
             let configuration: String?
         }
@@ -241,8 +246,8 @@ public struct PolicyEngine: Sendable {
             // unconditioned literal whose value feeds whichever configurations are
             // not masked by an override.
             let keys = [
-                Coverage(ruleID: violation.ruleID, scope: scope.displayName, name: name, configuration: configuration),
-                Coverage(ruleID: violation.ruleID, scope: scope.displayName, name: name, configuration: nil)
+                Coverage(ruleID: violation.ruleID, scope: scope, name: name, configuration: configuration),
+                Coverage(ruleID: violation.ruleID, scope: scope, name: name, configuration: nil)
             ]
             for key in keys {
                 reportedValues[key, default: []].insert(to)
@@ -268,7 +273,7 @@ public struct PolicyEngine: Sendable {
 
             let coverage = Coverage(
                 ruleID: violation.ruleID,
-                scope: scope.displayName,
+                scope: scope,
                 name: key.name,
                 configuration: configuration
             )

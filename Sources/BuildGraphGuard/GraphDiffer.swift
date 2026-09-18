@@ -228,6 +228,18 @@ public enum GraphDiffer {
                 }
             case (.some(let removed), nil):
                 changes.append(.targetRemoved(name: name, productType: removed.productType))
+                // Mirrors the added case above, and for a sharper reason. Without
+                // these, deleting a target that compiles four thousand files produces
+                // exactly one change — so the policy's membership-volume ceiling never
+                // fires and `membershipChurnPercentage` reads 0%. Under a policy that
+                // permits target removal, the largest possible edit to a build graph
+                // would sail through as the quietest.
+                for path in removed.membership {
+                    changes.append(.membershipRemoved(target: name, path: path))
+                }
+                for product in removed.packageProducts {
+                    changes.append(.packageProductUnlinked(target: name, product: product))
+                }
             case (.some(let before), .some(let after)):
                 changes.append(
                     contentsOf: modificationChanges(

@@ -162,14 +162,6 @@ public struct SettingTable: Equatable, Sendable {
         self.entries = entries
     }
 
-    public init(unconditioned pairs: [String: SettingValue]) {
-        var built: [SettingKey: SettingValue] = [:]
-        for (name, value) in pairs {
-            built[SettingKey(name: name)] = value
-        }
-        self.entries = built
-    }
-
     public var isEmpty: Bool { entries.isEmpty }
 
     public subscript(key: SettingKey) -> SettingValue? { entries[key] }
@@ -193,6 +185,27 @@ public struct SettingTable: Equatable, Sendable {
         return names
     }
 
+    /// Settings whose value is a version number and nothing else.
+    ///
+    /// These get their trailing zeros stripped during canonicalisation, which is the
+    /// only way to make the JSON number `17.0` and the JSON string `"17.0"` compare
+    /// equal: `Decodable` hands both to us as `Int(17)` (Foundation round-trips
+    /// `17.0` through `Double` and back losslessly), so the original spelling is gone
+    /// before any code here can see it. Without this, a project whose deployment
+    /// target is written as a bare number would report that setting as changed on
+    /// every single run — the exact migration-day noise this library exists to kill.
+    ///
+    /// The list is deliberately narrow. `MARKETING_VERSION` is **not** on it: `1.0.0`
+    /// and `1` are the same number and different user-facing strings, and collapsing
+    /// them would hide a real edit.
+    public static let versionValuedSettingNames: Set<String> = ["SWIFT_VERSION"]
+
+    /// Whether a setting name denotes a pure version number.
+    public static func isVersionValued(settingName: String) -> Bool {
+        versionValuedSettingNames.contains(settingName)
+            || settingName.hasSuffix("_DEPLOYMENT_TARGET")
+    }
+
     /// Normalises every value.
     ///
     /// Keys need no normalisation here: `SettingKey.init` sorts `conditions`, which
@@ -202,7 +215,18 @@ public struct SettingTable: Equatable, Sendable {
     /// branch for that collision; it was unreachable, and a branch that cannot run
     /// is a branch nobody can test.
     public func canonicalized() -> SettingTable {
-        SettingTable(entries.mapValues(\.canonicalized))
+        var built: [SettingKey: SettingValue] = [:]
+        built.reserveCapacity(entries.count)
+        for (key, value) in entries {
+            var canonical = value.canonicalized
+            if Self.isVersionValued(settingName: key.name),
+               case .string(let text) = canonical,
+               let version = DottedVersion(text) {
+                canonical = .string(version.canonicalSpelling)
+            }
+            built[key] = canonical
+        }
+        return SettingTable(built)
     }
 
     /// The effective value of every setting name for one build configuration.
