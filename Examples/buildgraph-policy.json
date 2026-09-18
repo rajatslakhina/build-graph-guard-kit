@@ -1,0 +1,25 @@
+{
+  "allowTargetCreation": true,
+  "allowTargetRemoval": false,
+  "deploymentFloors": {
+    "IPHONEOS_DEPLOYMENT_TARGET": "17.0",
+    "MACOSX_DEPLOYMENT_TARGET": "14.0"
+  },
+  "frozenSettingNames": [
+    "ENABLE_APP_SANDBOX",
+    "ENABLE_HARDENED_RUNTIME",
+    "ENABLE_USER_SCRIPT_SANDBOXING",
+    "OTHER_LDFLAGS",
+    "SWIFT_STRICT_CONCURRENCY"
+  ],
+  "frozenSettingPrefixes": [
+    "CODE_SIGN",
+    "DEVELOPMENT_TEAM",
+    "ENTITLEMENTS",
+    "PROVISIONING_PROFILE"
+  ],
+  "frozenTargets": [],
+  "maximumMembershipChanges": 40,
+  "packagePins": "pinned-versions-only",
+  "version": 1
+}
