@@ -193,51 +193,87 @@ public struct PolicyEngine: Sendable {
     /// line's information and names the configuration as well. Three rows for one
     /// edit is how a reviewer learns to scroll past findings.
     ///
-    /// "Provably" is doing real work here, and an earlier draft got it wrong by
-    /// keying only on rule/scope/name. A key like `OTHER_LDFLAGS[sdk=iphoneos*]`
-    /// is **not** covered by any effective finding — `SettingTable.resolved`
-    /// deliberately declines to resolve non-`config` dimensions rather than guess
-    /// which SDK a build will use — so a proposal that moved both the base
-    /// `OTHER_LDFLAGS` and added an `sdk`-qualified override would have had the
-    /// sdk finding silently deleted by the very layer meant to surface it.
+    /// "Provably" is doing real work here, and two earlier drafts got it wrong.
     ///
-    /// The rules, therefore:
-    /// - an **unconditioned** key is covered if any effective finding exists for
-    ///   that rule/scope/name, since its value feeds every configuration;
-    /// - a key conditioned **only** on `config` is covered if an effective finding
-    ///   exists for every configuration it names;
-    /// - a key carrying any **other** dimension is never covered, and is kept.
+    /// The first keyed only on rule/scope/name. A key like
+    /// `OTHER_LDFLAGS[sdk=iphoneos*]` is **not** covered by any effective finding —
+    /// `SettingTable.resolved` deliberately declines to resolve non-`config`
+    /// dimensions rather than guess which SDK a build will use — so a proposal that
+    /// moved both the base `OTHER_LDFLAGS` and added an `sdk`-qualified override had
+    /// the sdk finding deleted by the very layer meant to surface it.
+    ///
+    /// The second fixed that by checking dimension *names* and stopped there, which
+    /// left a value-shaped hole. If the base key moves but a per-configuration
+    /// override masks it in every configuration, the effective channel reports the
+    /// *override's* new value, not the base's — so "an effective finding exists for
+    /// this setting" was true while the base edit went unreported. Concretely: base
+    /// `-lz` → `-lz -levil` with a Release override `-lz` → `-lz -lcurl` surfaced
+    /// only `-lz -lcurl`, and `-levil` appeared in no violation at all.
+    ///
+    /// So coverage is decided on the **value**, not on the key's shape:
+    /// - a literal finding is covered only when some effective finding for the same
+    ///   rule, scope and setting name reports the *same resulting value* — which is
+    ///   what makes it genuinely redundant rather than merely adjacent;
+    /// - a `config`-conditioned literal must be matched by an effective finding for
+    ///   **that** configuration;
+    /// - a key carrying any non-`config` dimension is never covered;
+    /// - a key carrying more than one `config` condition is never covered either,
+    ///   because `resolved` can never select it (`allSatisfy` cannot hold for two
+    ///   different configuration names at once), so nothing derived from it exists.
     ///
     /// Per-configuration findings are never merged with each other: Debug dropping
     /// to 15.0 and Release dropping to 14.0 are two different problems.
     func collapsingRedundantChannels(_ violations: [PolicyViolation]) -> [PolicyViolation] {
-        var coveredNames: Set<String> = []
-        var coveredConfigurations: Set<String> = []
+        /// (rule, scope, name, configuration-or-nil) → the resulting values reported.
+        struct Coverage: Hashable {
+            let ruleID: String
+            let scope: String
+            let name: String
+            let configuration: String?
+        }
+        var reportedValues: [Coverage: Set<SettingValue?>] = [:]
+
         for violation in violations {
-            guard case .effectiveSettingChanged(let scope, let configuration, let name, _, _)?
+            guard case .effectiveSettingChanged(let scope, let configuration, let name, _, let to)?
                 = violation.change else { continue }
-            coveredNames.insert("\(violation.ruleID)|\(scope.displayName)|\(name)")
-            coveredConfigurations.insert(
-                "\(violation.ruleID)|\(scope.displayName)|\(name)|\(configuration)"
-            )
+            // Recorded twice: once against the specific configuration, for matching a
+            // `[config=…]` literal, and once against no configuration, for matching an
+            // unconditioned literal whose value feeds whichever configurations are
+            // not masked by an override.
+            let keys = [
+                Coverage(ruleID: violation.ruleID, scope: scope.displayName, name: name, configuration: configuration),
+                Coverage(ruleID: violation.ruleID, scope: scope.displayName, name: name, configuration: nil)
+            ]
+            for key in keys {
+                reportedValues[key, default: []].insert(to)
+            }
         }
 
         return violations.filter { violation in
-            guard case .settingChanged(let scope, let key, _, _)? = violation.change else {
+            guard case .settingChanged(let scope, let key, _, let to)? = violation.change else {
                 return true
             }
-            let subject = "\(violation.ruleID)|\(scope.displayName)|\(key.name)"
 
+            let configuration: String?
             if key.isUnconditioned {
-                return !coveredNames.contains(subject)
+                configuration = nil
+            } else {
+                let configConditions = key.conditions.filter { $0.dimension == "config" }
+                guard configConditions.count == key.conditions.count,
+                      configConditions.count == 1,
+                      let only = configConditions.first
+                else { return true }
+                configuration = only.value
             }
-            guard key.conditions.allSatisfy({ $0.dimension == "config" }) else {
-                return true
-            }
-            let everyConfigurationCovered = key.conditions.allSatisfy {
-                coveredConfigurations.contains("\(subject)|\($0.value)")
-            }
-            return !everyConfigurationCovered
+
+            let coverage = Coverage(
+                ruleID: violation.ruleID,
+                scope: scope.displayName,
+                name: key.name,
+                configuration: configuration
+            )
+            let isCovered = reportedValues[coverage]?.contains(to) ?? false
+            return !isCovered
         }
     }
 

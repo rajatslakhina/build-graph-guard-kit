@@ -416,7 +416,8 @@ extension ReviewScenario {
             detail: """
                 The dependency now resolves from example-0rg rather than example-org and \
                 tracks a branch instead of a version, the deployment floor drops to 15.0, \
-                and the app target compiles a file two directories above the repository.
+                and the app target compiles a file that sits outside the project \
+                directory, above the repository root.
                 """,
             baseline: .xcproj(SampleProjects.storefrontBaseline),
             proposed: .xcproj(SampleProjects.storefrontSupplyChainEdit)

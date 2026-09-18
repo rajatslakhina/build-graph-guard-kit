@@ -171,7 +171,6 @@ public struct SettingTable: Equatable, Sendable {
     }
 
     public var isEmpty: Bool { entries.isEmpty }
-    public var count: Int { entries.count }
 
     public subscript(key: SettingKey) -> SettingValue? { entries[key] }
 
@@ -182,9 +181,6 @@ public struct SettingTable: Equatable, Sendable {
     /// Keys in a deterministic order. Dictionary iteration order is not stable
     /// across processes in Swift, so every public ordering goes through here.
     public var sortedKeys: [SettingKey] { entries.keys.sorted() }
-
-    /// Every distinct setting *name*, ignoring conditions.
-    public var settingNames: Set<String> { Set(entries.keys.map(\.name)) }
 
     /// Every configuration name mentioned by any `[config=...]` qualifier.
     public var mentionedConfigurations: Set<String> {
@@ -197,26 +193,16 @@ public struct SettingTable: Equatable, Sendable {
         return names
     }
 
-    /// Normalises every value and re-parses every key into canonical order.
+    /// Normalises every value.
+    ///
+    /// Keys need no normalisation here: `SettingKey.init` sorts `conditions`, which
+    /// is `let`, and there is no other way to make one — so two keys differing only
+    /// in qualifier order are already the *same* dictionary key in `entries` and
+    /// cannot collide during the rebuild. An earlier version carried a tie-break
+    /// branch for that collision; it was unreachable, and a branch that cannot run
+    /// is a branch nobody can test.
     public func canonicalized() -> SettingTable {
-        var built: [SettingKey: SettingValue] = [:]
-        // `SettingKey.init` re-sorts conditions, so two keys that differ only in
-        // qualifier order collapse onto each other here. When they carry different
-        // values the survivor must be deterministic rather than whichever the
-        // dictionary happened to yield last, so ties resolve to the lexically
-        // smaller rendering.
-        for (key, value) in entries {
-            let canonicalKey = SettingKey(name: key.name, conditions: key.conditions)
-            let canonicalValue = value.canonicalized
-            if let existing = built[canonicalKey], existing != canonicalValue {
-                built[canonicalKey] = min(
-                    existing.displayText, canonicalValue.displayText
-                ) == existing.displayText ? existing : canonicalValue
-            } else {
-                built[canonicalKey] = canonicalValue
-            }
-        }
-        return SettingTable(built)
+        SettingTable(entries.mapValues(\.canonicalized))
     }
 
     /// The effective value of every setting name for one build configuration.
