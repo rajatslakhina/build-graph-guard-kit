@@ -57,9 +57,9 @@ which is not. `SettingTable.resolved(for:)` implements Xcode's precedence — mo
 
 **Canonicalisation is its own phase.** Rejected: folding it into the decoders. The library's central claim — semantic, not textual — is only checkable if canonicalisation is a function you can call twice and compare, and separating it keeps the `xcproj` and `pbxproj` paths from drifting apart silently.
 
-**A hand-written plist scanner.** Rejected: `PropertyListSerialization`, which does not exist on Linux, and the migration gate has to run in the same CI job as everything else on whatever runner is cheapest. The scanner also throws with a byte offset rather than an opaque Foundation error, which is what a reviewer reading a red log needs. It works over UTF-8 bytes with an explicit index and bounds-checked reads; `testEveryTruncationOfARealFileIsRejected` feeds all ~5,000 prefixes of a real `pbxproj` through the bridge and asserts every one is refused — a truncated file must never yield a usable build graph.
+**A hand-written plist scanner.** Rejected: `PropertyListSerialization`, which does not exist on Linux, and the migration gate has to run in the same CI job as everything else on whatever runner is cheapest. The scanner also throws with a byte offset rather than an opaque Foundation error, which is what a reviewer reading a red log needs. It works over UTF-8 bytes with an explicit index and bounds-checked reads; `testEveryTruncationOfARealFileIsRejected` feeds all 6,055 prefixes of a real `pbxproj` through the bridge and asserts every one is refused — a truncated file must never yield a usable build graph.
 
-**Uniform settings are hoisted during the bridge.** `pbxproj` stores a setting once per configuration; `xcproj` stores it once. Without hoisting, migration day reports every setting in the file as changed. `testWithoutHoistingTheSameMigrationWouldBeNoisy` builds the un-hoisted projection and asserts it *is* noisy, so the hoisted result's silence is known to be earned rather than accidental.
+**Uniform settings are hoisted during the bridge.** `pbxproj` stores a setting once per configuration; `xcproj` stores it once. Without hoisting, migration day reports every setting in the file as changed. `testWithoutHoistingTheSameMigrationWouldBeNoisy` runs the *real* bridge with `hoistUniformSettings: false` and asserts the result **is** noisy, so the hoisted result's silence is known to be earned rather than accidental.
 
 **Allow-with-a-frozen-list, not deny-by-default.** A deny-by-default setting policy is tighter on paper and abandoned in practice: an agent adding a source file legitimately touches membership and often a warning flag, so it fires on every commit and gets `--no-verify`'d inside a week. The baseline freezes only what is never an incidental side effect — signing, entitlements, sandboxing, deployment floor, dependency pins. Security that survives contact with a sprint beats security that is theoretically tighter.
 
@@ -73,7 +73,7 @@ which is not. `SettingTable.resolved(for:)` implements Xcode's precedence — mo
 
 This runs in CI on whatever is on the branch, including a file a crashed merge left half-written. A trap there is not a caught bug — it is an outage, and "the gate crashed" reads like flaky infrastructure rather than a rejected change. So:
 
-- **No unjustified force-unwraps.** Collection access is bounds-checked; the plist scanner's `peek` returns `Optional` and is the only read path.
+- **No unjustified force-unwraps.** There are none in `Sources` — no `!`, no `try!`, no `as!`. Every byte read in the plist scanner is bounds-checked: `peek` returns `Optional`, and the one range read (`parseBareString`) is guarded at both ends.
 - **No trapping arithmetic.** `SaturatingMath` routes every `+`, `*`, `/` and `Int(Double)` that Swift could trap on. `Int` ceilings derive from `Int.max` rather than 64-bit literals.
 - **No unbounded recursion.** The navigator walk in `XcprojDecoder.membership` uses an explicit stack with configurable ceilings (`DecodingLimits`, default 64 deep / 200,000 nodes). The plist scanner is recursive descent — honestly, it is not a stack machine — bounded by a hard `OpenStepPlist.maximumDepth` of 64, which is also what caps the `pbxproj` group walk. A stack overflow is uncatchable; a thrown error names the file.
 - **No infinite walks.** The `pbxproj` group tree is walked with a visited set, because a bad merge can produce a cycle.
@@ -135,7 +135,7 @@ A starting policy is in [`Examples/buildgraph-policy.json`](Examples/buildgraph-
 Swift 6.0, iOS 17+, macOS 14+. No dependencies.
 
 ```swift
-.package(url: "https://github.com/rajatslakhina/build-graph-guard-kit.git", from: "1.0.0")
+.package(url: "https://github.com/rajatslakhina/build-graph-guard-kit.git", from: "1.1.1")
 ```
 
 Products: `BuildGraphGuard` (the engine) and `BuildGraphGuardUI` (a SwiftUI review screen, `#if canImport(SwiftUI)`).
@@ -157,7 +157,7 @@ Stated exactly, because "it builds" and "it runs" are different claims and only 
 **What was verified:**
 
 - `swift build -Xswiftc -warnings-as-errors` from a wiped `.build` on Swift 6.0.3 (aarch64 Linux): exit 0, zero warnings.
-- `swift test`: **111 tests, 0 failures.**
+- `swift test`: **114 tests, 0 failures.**
 - CI on every push — see the **[Actions tab](https://github.com/rajatslakhina/build-graph-guard-kit/actions)**. The Linux job re-runs the warnings-as-errors build and the full suite; the macOS job runs the suite against the macOS SDK and then type-checks `BuildGraphGuardUI` against the iOS SDK with `xcodebuild -scheme BuildGraphGuardUI -destination 'generic/platform=iOS Simulator'`. That second job is the only thing that compiles the view layer at all — on Linux its sources sit behind `#if canImport(SwiftUI)` and compile to nothing, so a green Linux run says nothing about it.
 - The demo repo's own CI resolves this package **from github.com at its published tag** and then compiles the app against it, which is what proves the split-repo structure genuinely works rather than merely being described.
 
@@ -176,7 +176,7 @@ Coverage counts are easy to inflate, so these are the ones that would go red if 
 | `testReleaseOnlyOverrideIsInvisibleToTheLiteralChannelAlone` | the effective-value channel — it asserts the literal key is unchanged *and* the effective one moved |
 | `testSameEditPassesUnderAPolicyThatFreezesNothing` | the policy's authority — the same diff must pass under a permissive policy |
 | `testSdkQualifiedFindingSurvivesTheChannelCollapse` | the de-duplication's condition check — an `sdk`-qualified finding must never be collapsed away |
-| `testEveryTruncationOfARealFileIsRejected` | the scanner's bounds checks — all ~5,000 prefixes must be refused |
+| `testEveryTruncationOfARealFileIsRejected` | the scanner's bounds checks — all 6,055 prefixes must be refused |
 | `testCommittedExamplePolicyIsExactlyTheBaseline` | deterministic encoding — it reads the committed file, not a copy |
 | `testReadmeRuleTableMatchesTheEnginesVocabularyExactly` | this README's rule table — parsed at test time and compared for *equality* against ids gathered from real assessments |
 | `testCanonicalizationIsIdempotentStartingFromMessyInput` | canonicalisation — the input is non-canonical, so the identity function fails it |
