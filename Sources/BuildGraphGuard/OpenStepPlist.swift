@@ -31,9 +31,13 @@ public indirect enum PlistValue: Hashable, Sendable {
 /// than an opaque Foundation error, which is what a reviewer reading a red CI log
 /// actually needs.
 ///
-/// The scanner works over UTF-8 bytes with an explicit index and an explicit
-/// container stack. Every read is bounds-checked and nesting is capped, so a
-/// truncated or hostile file throws rather than crashing.
+/// The scanner works over UTF-8 bytes with an explicit index; every read is
+/// bounds-checked, so a truncated file throws rather than reading past the end.
+/// Container nesting is recursive descent — `parseValue` calls `parseDictionary`
+/// and `parseArray`, which call back into `parseValue` — bounded by a hard
+/// `maximumDepth` check rather than by the stack. (The *other* tree walk, over the
+/// navigator in `XcprojDecoder.membership`, uses an explicit stack; this one does
+/// not, and the depth cap is what keeps it safe.)
 public enum OpenStepPlist {
 
     /// Maximum container nesting. `pbxproj` files are two deep in practice

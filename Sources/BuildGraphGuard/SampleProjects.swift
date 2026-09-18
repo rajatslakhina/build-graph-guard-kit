@@ -4,7 +4,7 @@ import Foundation
 ///
 /// These are *fixtures*, not documentation. The tests assert against the same
 /// strings the demo renders, so a scenario that stops producing the finding its
-/// title advertises fails CI rather than quietly becoming a screenshot of nothing.
+/// title advertises fails CI rather than quietly becoming a screen full of nothing.
 public enum SampleProjects {
 
     // MARK: - xcproj

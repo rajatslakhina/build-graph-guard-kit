@@ -60,16 +60,23 @@ public enum SaturatingMath {
     /// Returns 0 when `total` is zero, which is the honest answer for "what share
     /// of nothing is this" and keeps callers from having to special-case it.
     ///
-    /// The `part >= total` shortcut is load-bearing rather than an optimisation.
-    /// Without it, `part * 100` saturates at `Int.max` for large inputs and the
-    /// subsequent division then reports 1% for what is actually 100% — a clamp
-    /// that silently produces a *wrong number* instead of a large one, which is the
-    /// worse of the two failure modes.
+    /// Saturation is the hazard to design around, not overflow: `part * 100`
+    /// clamping at `Int.max` and then dividing produces a small, plausible-looking
+    /// *wrong* number rather than an obviously broken one. `percentage(Int.max, of:
+    /// Int.max)` would read 1%, and so would `percentage(Int.max / 2, of: Int.max)`,
+    /// which is 50%. Both are handled: the `part >= total` shortcut covers the
+    /// first, and scaling the denominator instead of the numerator covers every
+    /// case where `part * 100` would not fit.
     public static func percentage(_ part: Int, of total: Int) -> Int {
         guard total > 0, part > 0 else { return 0 }
         guard part < total else { return 100 }
-        let scaled = multiply(part, 100)
-        return min(100, divide(scaled, by: total))
+        guard part > Int.max / 100 else {
+            return min(100, divide(multiply(part, 100), by: total))
+        }
+        // Divide first. `total / 100` is at least 1 here, because `total > part >
+        // Int.max / 100`, so the fallback can never be reached — it is present only
+        // so the expression is total.
+        return min(100, divide(part, by: divide(total, by: 100, fallback: 1), fallback: 0))
     }
 }
 

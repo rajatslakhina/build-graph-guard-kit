@@ -1,7 +1,7 @@
 import Foundation
 
 /// How serious a policy finding is.
-public enum ViolationSeverity: Int, Comparable, Sendable, CaseIterable {
+public enum ViolationSeverity: Int, Comparable, Sendable {
     /// Informational; never affects the verdict.
     case advisory = 0
     /// Merits a human read before merge.
@@ -62,9 +62,12 @@ public enum PolicyVerdict: Sendable, Equatable {
     case needsReview
     case blocked
 
+    /// `.clean` reads "No blocking findings", not "No policy findings": an
+    /// advisory is a policy finding and deliberately does not move the verdict, so
+    /// the stronger wording would contradict an advisory row rendered underneath it.
     public var label: String {
         switch self {
-        case .clean: return "No policy findings"
+        case .clean: return "No blocking findings"
         case .needsReview: return "Needs review"
         case .blocked: return "Blocked"
         }
@@ -93,8 +96,8 @@ public struct PolicyAssessment: Sendable, Equatable {
         violations.filter { $0.severity == .warning }
     }
 
-    public func violations(forTarget target: String?) -> [PolicyViolation] {
-        violations.filter { $0.change?.targetName == target }
+    public var advisories: [PolicyViolation] {
+        violations.filter { $0.severity == .advisory }
     }
 }
 
@@ -145,37 +148,17 @@ public struct PolicyEngine: Sendable {
                     change: nil,
                     explanation: """
                         Baseline is \(diff.baselineOrigin.displayName) and proposal is \
-                        \(diff.proposedOrigin.displayName). Fields PbxprojBridge does not \
-                        model (\(PbxprojBridge.BridgeCoverage.notModelled.joined(separator: ", "))) \
-                        cannot be compared across formats.
+                        \(diff.proposedOrigin.displayName). PbxprojBridge models \
+                        \(PbxprojBridge.BridgeCoverage.modelled.joined(separator: ", ")); it does \
+                        not model \
+                        \(PbxprojBridge.BridgeCoverage.notModelled.joined(separator: ", ")), and \
+                        those cannot be compared across formats.
                         """
                 )
             )
         }
 
-        // The differ deliberately reports a setting on two channels — the literal
-        // key and the effective per-configuration value — because each catches
-        // something the other misses. For a *finding*, that is pure redundancy
-        // whenever both fired on the same rule, scope and setting: the effective
-        // line says everything the literal line says and names the configuration
-        // as well. Three rows for one edit is how a reviewer learns to scroll past
-        // findings, so the literal one is dropped where the effective one covers it.
-        //
-        // Per-configuration findings are kept separate rather than merged: Debug
-        // dropping to 15.0 and Release dropping to 14.0 are two different problems.
-        let effectiveSubjects: Set<String> = Set(
-            violations.compactMap { violation in
-                guard case .effectiveSettingChanged(let scope, _, let name, _, _)? = violation.change
-                else { return nil }
-                return "\(violation.ruleID)|\(scope.displayName)|\(name)"
-            }
-        )
-        violations.removeAll { violation in
-            guard case .settingChanged(let scope, let key, _, _)? = violation.change else {
-                return false
-            }
-            return effectiveSubjects.contains("\(violation.ruleID)|\(scope.displayName)|\(key.name)")
-        }
+        violations = collapsingRedundantChannels(violations)
 
         let ordered = violations.sorted {
             if $0.severity != $1.severity { return $0.severity > $1.severity }
@@ -198,6 +181,64 @@ public struct PolicyEngine: Sendable {
             diff: diff,
             riskScore: RiskScorer.score(diff)
         )
+    }
+
+    /// Drops a literal-channel finding when an effective-channel finding provably
+    /// says everything it says.
+    ///
+    /// The differ reports a setting on two channels on purpose — the literal key
+    /// and the effective per-configuration value — because each catches something
+    /// the other misses. For a *finding*, that is redundancy whenever both fired
+    /// on the same rule, scope and setting: the effective line carries the literal
+    /// line's information and names the configuration as well. Three rows for one
+    /// edit is how a reviewer learns to scroll past findings.
+    ///
+    /// "Provably" is doing real work here, and an earlier draft got it wrong by
+    /// keying only on rule/scope/name. A key like `OTHER_LDFLAGS[sdk=iphoneos*]`
+    /// is **not** covered by any effective finding — `SettingTable.resolved`
+    /// deliberately declines to resolve non-`config` dimensions rather than guess
+    /// which SDK a build will use — so a proposal that moved both the base
+    /// `OTHER_LDFLAGS` and added an `sdk`-qualified override would have had the
+    /// sdk finding silently deleted by the very layer meant to surface it.
+    ///
+    /// The rules, therefore:
+    /// - an **unconditioned** key is covered if any effective finding exists for
+    ///   that rule/scope/name, since its value feeds every configuration;
+    /// - a key conditioned **only** on `config` is covered if an effective finding
+    ///   exists for every configuration it names;
+    /// - a key carrying any **other** dimension is never covered, and is kept.
+    ///
+    /// Per-configuration findings are never merged with each other: Debug dropping
+    /// to 15.0 and Release dropping to 14.0 are two different problems.
+    func collapsingRedundantChannels(_ violations: [PolicyViolation]) -> [PolicyViolation] {
+        var coveredNames: Set<String> = []
+        var coveredConfigurations: Set<String> = []
+        for violation in violations {
+            guard case .effectiveSettingChanged(let scope, let configuration, let name, _, _)?
+                = violation.change else { continue }
+            coveredNames.insert("\(violation.ruleID)|\(scope.displayName)|\(name)")
+            coveredConfigurations.insert(
+                "\(violation.ruleID)|\(scope.displayName)|\(name)|\(configuration)"
+            )
+        }
+
+        return violations.filter { violation in
+            guard case .settingChanged(let scope, let key, _, _)? = violation.change else {
+                return true
+            }
+            let subject = "\(violation.ruleID)|\(scope.displayName)|\(key.name)"
+
+            if key.isUnconditioned {
+                return !coveredNames.contains(subject)
+            }
+            guard key.conditions.allSatisfy({ $0.dimension == "config" }) else {
+                return true
+            }
+            let everyConfigurationCovered = key.conditions.allSatisfy {
+                coveredConfigurations.contains("\(subject)|\($0.value)")
+            }
+            return !everyConfigurationCovered
+        }
     }
 
     // MARK: - Per-change rules

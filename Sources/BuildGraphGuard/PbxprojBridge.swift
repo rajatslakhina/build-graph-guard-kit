@@ -35,7 +35,16 @@ public enum PbxprojBridge {
         ]
     }
 
-    public static func decode(_ text: String) throws -> ProjectGraph {
+    /// - Parameter hoistUniformSettings: whether to collapse a setting that has the
+    ///   same value in every configuration onto one unconditioned key. Always `true`
+    ///   in production; the parameter exists so the test suite can run the *real*
+    ///   bridge with hoisting off and assert that the migration diff really is noisy
+    ///   without it. A test that rebuilds the un-hoisted table inline would prove
+    ///   only that the test's own arithmetic works.
+    public static func decode(
+        _ text: String,
+        hoistUniformSettings: Bool = true
+    ) throws -> ProjectGraph {
         let root = try OpenStepPlist.parse(text)
         guard let fields = root.dictionaryValue else {
             throw GraphDecodingError.malformedPlist(reason: "root is not a dictionary")
@@ -56,7 +65,8 @@ public enum PbxprojBridge {
         let pathIndex = filePathIndex(objects: objects, project: project)
         let projectSettings = settings(
             configurationListID: project["buildConfigurationList"]?.stringValue,
-            objects: objects
+            objects: objects,
+            hoistUniformSettings: hoistUniformSettings
         )
         let packages = packageDependencies(objects: objects, project: project)
 
@@ -73,7 +83,8 @@ public enum PbxprojBridge {
             )
             let targetSettings = settings(
                 configurationListID: target["buildConfigurationList"]?.stringValue,
-                objects: objects
+                objects: objects,
+                hoistUniformSettings: hoistUniformSettings
             )
             let packageProducts = (target["packageProductDependencies"]?.arrayValue ?? [])
                 .compactMap(\.stringValue)
@@ -199,7 +210,8 @@ public enum PbxprojBridge {
     /// every configuration to an unconditioned key.
     static func settings(
         configurationListID: String?,
-        objects: [String: PlistValue]
+        objects: [String: PlistValue],
+        hoistUniformSettings: Bool = true
     ) -> SettingTable {
         guard let configurationListID,
               let list = objects[configurationListID]?.dictionaryValue,
@@ -230,7 +242,8 @@ public enum PbxprojBridge {
         var table = SettingTable()
         for settingName in everySettingName.sorted() {
             let present = configurationNames.compactMap { perConfiguration[$0]?[settingName] }
-            let isUniform = present.count == configurationNames.count
+            let isUniform = hoistUniformSettings
+                && present.count == configurationNames.count
                 && Set(present).count == 1
             if isUniform, let shared = present.first {
                 table.set(shared, for: SettingKey(name: settingName))

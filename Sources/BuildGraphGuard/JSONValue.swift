@@ -75,14 +75,19 @@ public indirect enum JSONValue: Hashable, Sendable {
         }
     }
 
-    /// Renders a JSON number without an exponent or a spurious `.0`, so that
-    /// `SWIFT_VERSION: 6.0` and `SWIFT_VERSION: "6.0"` canonicalise to the same
-    /// setting value rather than diffing forever.
+    /// Renders a JSON number as a setting value.
+    ///
+    /// Swift's own `String(Double)` is exactly right here and an earlier draft was
+    /// exactly wrong: it collapsed integral doubles to `Int`, so JSON
+    /// `IPHONEOS_DEPLOYMENT_TARGET: 17.0` became `"17"` and diffed forever against
+    /// the string `"17.0"` — precisely the migration-day noise this library exists
+    /// to suppress. `String(17.0)` is `"17.0"`, which matches.
+    ///
+    /// Very large magnitudes still render in exponent form (`String(1e30)` is
+    /// `"1e+30"`). That is not pretty, but a build setting is never legitimately
+    /// 1e30, and inventing a digit expansion for it would be making up data.
     private static func renderNumber(_ number: Double) -> String {
         guard number.isFinite else { return number > 0 ? "inf" : "-inf" }
-        if number == number.rounded(), abs(number) < Double(Int.max) {
-            return String(SaturatingMath.integer(clamping: number))
-        }
         return String(number)
     }
 }

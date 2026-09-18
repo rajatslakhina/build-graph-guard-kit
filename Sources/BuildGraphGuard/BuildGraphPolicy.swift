@@ -1,7 +1,7 @@
 import Foundation
 
 /// How package pins may move.
-public enum PackagePinPolicy: String, Codable, Sendable, CaseIterable {
+public enum PackagePinPolicy: String, Codable, Sendable {
     /// Repository URLs and requirements are both frozen.
     case frozen
     /// Requirements may move, but never to a branch or a floating ref, and the
@@ -29,7 +29,12 @@ public struct BuildGraphPolicy: Codable, Equatable, Sendable {
     public var frozenSettingNames: Set<String>
     /// Setting-name prefixes that may never change. Cheaper to maintain than an
     /// exhaustive name list against an SDK that adds keys every year.
-    public var frozenSettingPrefixes: [String]
+    ///
+    /// A `Set` rather than an `Array` so that two policies listing the same
+    /// prefixes in different orders compare equal — order carries no meaning for
+    /// prefix matching, and order-sensitive equality would make a round-tripped
+    /// policy file unequal to the policy it came from.
+    public var frozenSettingPrefixes: Set<String>
     /// Targets no automated writer may modify at all.
     public var frozenTargets: Set<String>
     /// Minimum acceptable value for deployment-target settings.
@@ -45,7 +50,7 @@ public struct BuildGraphPolicy: Codable, Equatable, Sendable {
     public init(
         version: Int = 1,
         frozenSettingNames: Set<String> = [],
-        frozenSettingPrefixes: [String] = [],
+        frozenSettingPrefixes: Set<String> = [],
         frozenTargets: Set<String> = [],
         deploymentFloors: [String: String] = [:],
         packagePins: PackagePinPolicy = .pinnedVersionsOnly,
@@ -106,9 +111,61 @@ public struct BuildGraphPolicy: Codable, Equatable, Sendable {
         try JSONDecoder().decode(BuildGraphPolicy.self, from: data)
     }
 
+    /// Encodes to stable bytes.
+    ///
+    /// `.sortedKeys` orders object *keys*; it does nothing for the elements of an
+    /// array, and `Set`'s own iteration order is seeded per process. So a policy
+    /// encoded twice in two processes would differ, a committed policy file could
+    /// never be checked against `baseline`, and the diff of a policy change would
+    /// be full of reordering noise — in a tool whose entire thesis is that
+    /// reordering noise hides real change. The custom `encode(to:)` below sorts
+    /// every collection so the bytes are a function of the value alone.
     public func encoded() throws -> Data {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         return try encoder.encode(self)
+    }
+}
+
+extension BuildGraphPolicy {
+
+    private enum CodingKeys: String, CodingKey {
+        case version
+        case frozenSettingNames
+        case frozenSettingPrefixes
+        case frozenTargets
+        case deploymentFloors
+        case packagePins
+        case allowTargetCreation
+        case allowTargetRemoval
+        case maximumMembershipChanges
+    }
+
+    public func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(version, forKey: .version)
+        try container.encode(frozenSettingNames.sorted(), forKey: .frozenSettingNames)
+        try container.encode(frozenSettingPrefixes.sorted(), forKey: .frozenSettingPrefixes)
+        try container.encode(frozenTargets.sorted(), forKey: .frozenTargets)
+        try container.encode(deploymentFloors, forKey: .deploymentFloors)
+        try container.encode(packagePins, forKey: .packagePins)
+        try container.encode(allowTargetCreation, forKey: .allowTargetCreation)
+        try container.encode(allowTargetRemoval, forKey: .allowTargetRemoval)
+        try container.encode(maximumMembershipChanges, forKey: .maximumMembershipChanges)
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(
+            version: try container.decode(Int.self, forKey: .version),
+            frozenSettingNames: Set(try container.decode([String].self, forKey: .frozenSettingNames)),
+            frozenSettingPrefixes: Set(try container.decode([String].self, forKey: .frozenSettingPrefixes)),
+            frozenTargets: Set(try container.decode([String].self, forKey: .frozenTargets)),
+            deploymentFloors: try container.decode([String: String].self, forKey: .deploymentFloors),
+            packagePins: try container.decode(PackagePinPolicy.self, forKey: .packagePins),
+            allowTargetCreation: try container.decode(Bool.self, forKey: .allowTargetCreation),
+            allowTargetRemoval: try container.decode(Bool.self, forKey: .allowTargetRemoval),
+            maximumMembershipChanges: try container.decode(Int.self, forKey: .maximumMembershipChanges)
+        )
     }
 }
