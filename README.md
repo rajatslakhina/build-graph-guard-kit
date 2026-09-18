@@ -57,7 +57,7 @@ which is not. `SettingTable.resolved(for:)` implements Xcode's precedence — mo
 
 **Canonicalisation is its own phase.** Rejected: folding it into the decoders. The library's central claim — semantic, not textual — is only checkable if canonicalisation is a function you can call twice and compare, and separating it keeps the `xcproj` and `pbxproj` paths from drifting apart silently.
 
-**A hand-written plist scanner.** Rejected: `PropertyListSerialization`, which does not exist on Linux, and the migration gate has to run in the same CI job as everything else on whatever runner is cheapest. The scanner also throws with a byte offset rather than an opaque Foundation error, which is what a reviewer reading a red log needs. It works over UTF-8 bytes with an explicit index and bounds-checked reads; `OpenStepPlistTests` walks every truncation of a real fixture to prove it throws rather than traps.
+**A hand-written plist scanner.** Rejected: `PropertyListSerialization`, which does not exist on Linux, and the migration gate has to run in the same CI job as everything else on whatever runner is cheapest. The scanner also throws with a byte offset rather than an opaque Foundation error, which is what a reviewer reading a red log needs. It works over UTF-8 bytes with an explicit index and bounds-checked reads; `testEveryTruncationOfARealFileIsRejected` feeds all ~5,000 prefixes of a real `pbxproj` through the bridge and asserts every one is refused — a truncated file must never yield a usable build graph.
 
 **Uniform settings are hoisted during the bridge.** `pbxproj` stores a setting once per configuration; `xcproj` stores it once. Without hoisting, migration day reports every setting in the file as changed. `testWithoutHoistingTheSameMigrationWouldBeNoisy` builds the un-hoisted projection and asserts it *is* noisy, so the hoisted result's silence is known to be earned rather than accidental.
 
@@ -75,7 +75,7 @@ This runs in CI on whatever is on the branch, including a file a crashed merge l
 
 - **No unjustified force-unwraps.** Collection access is bounds-checked; the plist scanner's `peek` returns `Optional` and is the only read path.
 - **No trapping arithmetic.** `SaturatingMath` routes every `+`, `*`, `/` and `Int(Double)` that Swift could trap on. `Int` ceilings derive from `Int.max` rather than 64-bit literals.
-- **No unbounded recursion.** Both tree walks use an explicit stack with a depth cap (`XcprojDecoder.DecodingLimits`, default 64 deep / 200,000 nodes) — a stack overflow is uncatchable, a thrown error names the file.
+- **No unbounded recursion.** The navigator walk in `XcprojDecoder.membership` uses an explicit stack with configurable ceilings (`DecodingLimits`, default 64 deep / 200,000 nodes). The plist scanner is recursive descent — honestly, it is not a stack machine — bounded by a hard `OpenStepPlist.maximumDepth` of 64, which is also what caps the `pbxproj` group walk. A stack overflow is uncatchable; a thrown error names the file.
 - **No infinite walks.** The `pbxproj` group tree is walked with a visited set, because a bad merge can produce a cycle.
 - **Version comparison is numeric.** `"9.0" > "17.0"` lexically, so a string-compared deployment floor would wave through exactly the regression it exists to catch.
 
@@ -86,6 +86,7 @@ This runs in CI on whatever is on the branch, including a file a crashed merge l
 ## Usage
 
 ```swift
+import Foundation
 import BuildGraphGuard
 
 let baseline = try XcprojDecoder.decode(Data(contentsOf: baselineURL))
@@ -107,7 +108,7 @@ let legacy = try PbxprojBridge.decode(String(contentsOf: pbxprojURL, encoding: .
 let diff = GraphDiffer.diff(baseline: legacy, proposed: proposed)   // diff.isCrossFormat == true
 ```
 
-A starting policy is in [`Examples/buildgraph-policy.json`](Examples/buildgraph-policy.json) — it is `BuildGraphPolicy.baseline` serialised.
+A starting policy is in [`Examples/buildgraph-policy.json`](Examples/buildgraph-policy.json) — it is `BuildGraphPolicy.baseline` serialised, byte for byte. `testCommittedExamplePolicyIsExactlyTheBaseline` opens that exact file and asserts both that it decodes back to `.baseline` and that `baseline.encoded()` reproduces it, so the claim is checked rather than asserted.
 
 ### Rules
 
@@ -143,13 +144,42 @@ Products: `BuildGraphGuard` (the engine) and `BuildGraphGuardUI` (a SwiftUI revi
 
 ## Demo app
 
-Demo app: (added after the companion repo is pushed — see below)
+**[build-graph-guard-demo-app](https://github.com/rajatslakhina/build-graph-guard-demo-app)** — a SwiftUI app that consumes this package as a *remote, version-pinned* dependency (`XCRemoteSwiftPackageReference`, `upToNextMajorVersion` from this repo's published tag — not a local path and not a branch). It renders the four sample scenarios as a review screen, with its own tightened policy compiled in.
+
+Clone it, open `Demo.xcodeproj`, select the `Demo` scheme, pick any Simulator, Build & Run.
 
 ---
 
 ## Verification
 
-(filled in after CI reports — see below)
+Stated exactly, because "it builds" and "it runs" are different claims and only one of them is true here.
+
+**What was verified:**
+
+- `swift build -Xswiftc -warnings-as-errors` from a wiped `.build` on Swift 6.0.3 (aarch64 Linux): exit 0, zero warnings.
+- `swift test`: **111 tests, 0 failures.**
+- CI on every push — see the **[Actions tab](https://github.com/rajatslakhina/build-graph-guard-kit/actions)**. The Linux job re-runs the warnings-as-errors build and the full suite; the macOS job runs the suite against the macOS SDK and then type-checks `BuildGraphGuardUI` against the iOS SDK with `xcodebuild -scheme BuildGraphGuardUI -destination 'generic/platform=iOS Simulator'`. That second job is the only thing that compiles the view layer at all — on Linux its sources sit behind `#if canImport(SwiftUI)` and compile to nothing, so a green Linux run says nothing about it.
+- The demo repo's own CI resolves this package **from github.com at its published tag** and then compiles the app against it, which is what proves the split-repo structure genuinely works rather than merely being described.
+
+**What was *not* verified:**
+
+- **The demo app has never been launched on a Simulator.** Automated access to Xcode and Simulator was requested three times during this build and refused each time (`Computer-use access to "Xcode 26.3", "Simulator" can't be approved during a scheduled run`). "Compiles for a Simulator destination" is what CI shows; "ran on a Simulator" is not claimed anywhere.
+- **There are no screenshots**, in either repo, because there was no running app to photograph. Nothing in either README describes an image that does not exist.
+
+### Tests that are designed to fail against a broken implementation
+
+Coverage counts are easy to inflate, so these are the ones that would go red if the thing they guard were deleted:
+
+| Test | Deleting this makes it fail |
+|---|---|
+| `testWithoutHoistingTheSameMigrationWouldBeNoisy` | `PbxprojBridge`'s hoist — it runs the *real* bridge with `hoistUniformSettings: false` rather than rebuilding an un-hoisted table inline |
+| `testReleaseOnlyOverrideIsInvisibleToTheLiteralChannelAlone` | the effective-value channel — it asserts the literal key is unchanged *and* the effective one moved |
+| `testSameEditPassesUnderAPolicyThatFreezesNothing` | the policy's authority — the same diff must pass under a permissive policy |
+| `testSdkQualifiedFindingSurvivesTheChannelCollapse` | the de-duplication's condition check — an `sdk`-qualified finding must never be collapsed away |
+| `testEveryTruncationOfARealFileIsRejected` | the scanner's bounds checks — all ~5,000 prefixes must be refused |
+| `testCommittedExamplePolicyIsExactlyTheBaseline` | deterministic encoding — it reads the committed file, not a copy |
+| `testReadmeRuleTableMatchesTheEnginesVocabularyExactly` | this README's rule table — parsed at test time and compared for *equality* against ids gathered from real assessments |
+| `testCanonicalizationIsIdempotentStartingFromMessyInput` | canonicalisation — the input is non-canonical, so the identity function fails it |
 
 ---
 
