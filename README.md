@@ -157,7 +157,7 @@ Stated exactly, because "it builds" and "it runs" are different claims and only 
 **What was verified:**
 
 - `swift build -Xswiftc -warnings-as-errors` from a wiped `.build` on Swift 6.0.3 (aarch64 Linux): exit 0, zero warnings.
-- `swift test`: **114 tests, 0 failures.**
+- `swift test`: **119 tests, 0 failures.**
 - CI on every push — see the **[Actions tab](https://github.com/rajatslakhina/build-graph-guard-kit/actions)**. The Linux job re-runs the warnings-as-errors build and the full suite; the macOS job runs the suite against the macOS SDK and then type-checks `BuildGraphGuardUI` against the iOS SDK with `xcodebuild -scheme BuildGraphGuardUI -destination 'generic/platform=iOS Simulator'`. That second job is the only thing that compiles the view layer at all — on Linux its sources sit behind `#if canImport(SwiftUI)` and compile to nothing, so a green Linux run says nothing about it.
 - The demo repo's own CI resolves this package **from github.com at its published tag** and then compiles the app against it, which is what proves the split-repo structure genuinely works rather than merely being described.
 
@@ -179,7 +179,11 @@ Coverage counts are easy to inflate, so these are the ones that would go red if 
 | `testEveryTruncationOfARealFileIsRejected` | the scanner's bounds checks — all 6,055 prefixes must be refused |
 | `testCommittedExamplePolicyIsExactlyTheBaseline` | deterministic encoding — it reads the committed file, not a copy |
 | `testReadmeRuleTableMatchesTheEnginesVocabularyExactly` | this README's rule table — parsed at test time and compared for *equality* against ids gathered from real assessments |
+| `testReadmeRuleTableSeveritiesMatchTheEngine` | the Severity column below — parsed from this file and compared against the severity each rule actually fires at |
 | `testCanonicalizationIsIdempotentStartingFromMessyInput` | canonicalisation — the input is non-canonical, so the identity function fails it |
+| `testViolationsAreOrderedBlockingThenWarningThenAdvisory` | the sort in `assess` — the fixture constructs a warning *before* a blocking finding, so unsorted order is already wrong |
+| `testVersionSettingsCompareEqualAcrossJSONNumberAndStringSpellings` | version canonicalisation — runs through the real decoder, where `17.0` arrives as `Int(17)` |
+| `testRemovingATargetReportsTheMembershipItTakesWithIt` | the removed-target branch of the differ — without it, deleting a target reports zero membership edits |
 
 ---
 
