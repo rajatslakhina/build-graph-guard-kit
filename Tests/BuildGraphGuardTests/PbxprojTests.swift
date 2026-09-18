@@ -77,7 +77,9 @@ final class OpenStepPlistTests: XCTestCase {
     /// green, and the README nonetheless claimed it proved "throws rather than traps".
     func testEveryTruncationOfARealFileIsRejected() throws {
         let characters = Array(SampleProjects.storefrontLegacy)
-        XCTAssertGreaterThan(characters.count, 1_000, "fixture should be substantial")
+        // Pinned, not approximate: the README quotes this number, and "~5,000" was
+        // wrong by 20% in a document whose thesis is that claims get checked.
+        XCTAssertEqual(characters.count, 6_055, "fixture size changed; update the README")
 
         for prefixLength in 0..<characters.count {
             let prefix = String(characters[0..<prefixLength])
@@ -240,6 +242,18 @@ final class PbxprojBridgeTests: XCTestCase {
         let advisory = try XCTUnwrap(
             assessment.violations.first { $0.ruleID == "format.cross-format-comparison" }
         )
+
+        // Non-emptiness first. A bare `for item in …` loop over an empty array is
+        // vacuously true, so emptying `BridgeCoverage` would otherwise degrade the
+        // advisory to "PbxprojBridge models ; it does not model ," with nothing red.
+        XCTAssertFalse(PbxprojBridge.BridgeCoverage.modelled.isEmpty)
+        XCTAssertFalse(PbxprojBridge.BridgeCoverage.notModelled.isEmpty)
+        XCTAssertTrue(
+            advisory.explanation.contains("shell-script phases"),
+            "a named limitation must survive into the text a reviewer reads"
+        )
+        XCTAssertTrue(advisory.explanation.contains("target names"))
+
         for item in PbxprojBridge.BridgeCoverage.notModelled {
             XCTAssertTrue(
                 advisory.explanation.contains(item),

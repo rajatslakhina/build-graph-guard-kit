@@ -257,6 +257,73 @@ final class PolicyEngineTests: XCTestCase {
         XCTAssertFalse(unconditionedLiteral)
     }
 
+    /// Coverage is decided on the resulting **value**, not on the key's shape.
+    ///
+    /// When a per-configuration override masks the base key, the effective channel
+    /// reports the *override's* new value. Keying coverage on "an effective finding
+    /// exists for this setting" therefore deleted the base edit while reporting a
+    /// different one — here, `-levil` vanished from every violation while `-lcurl`
+    /// was the only thing on screen.
+    func testBaseKeyEditIsNotCoveredByAnOverridesEffectiveFinding() throws {
+        let baseline = """
+        {"schema-version":1,"name":"X","build-settings":{
+          "OTHER_LDFLAGS": "-lz",
+          "OTHER_LDFLAGS[config=Debug]": "-lz",
+          "OTHER_LDFLAGS[config=Release]": "-lz"
+        }}
+        """
+        let proposed = """
+        {"schema-version":1,"name":"X","build-settings":{
+          "OTHER_LDFLAGS": "-lz -levil",
+          "OTHER_LDFLAGS[config=Debug]": "-lz",
+          "OTHER_LDFLAGS[config=Release]": "-lz -lcurl"
+        }}
+        """
+        let assessment = try assess(baseline, proposed)
+        let frozen = assessment.violations.filter { $0.ruleID == "setting.frozen" }
+
+        let reportsEvil = frozen.contains { violation in
+            switch violation.change {
+            case .settingChanged(_, _, _, let to)?, .effectiveSettingChanged(_, _, _, _, let to)?:
+                return to == .string("-lz -levil")
+            default:
+                return false
+            }
+        }
+        XCTAssertTrue(reportsEvil, "the edit to the base key must appear in some violation")
+
+        let reportsCurl = frozen.contains { violation in
+            switch violation.change {
+            case .settingChanged(_, _, _, let to)?, .effectiveSettingChanged(_, _, _, _, let to)?:
+                return to == .string("-lz -lcurl")
+            default:
+                return false
+            }
+        }
+        XCTAssertTrue(reportsCurl, "the Release override must also be reported")
+        XCTAssertEqual(assessment.verdict, .blocked)
+    }
+
+    /// A key qualified on two configurations at once can never be selected by
+    /// `SettingTable.resolved` — `allSatisfy` cannot hold for two different
+    /// configuration names — so nothing the effective channel produces derives from
+    /// it, and it must never be collapsed away.
+    func testDoublyConfigQualifiedKeyIsNeverCollapsed() throws {
+        let baseline = #"{"schema-version":1,"name":"X","build-settings":{"OTHER_LDFLAGS":"-lz"}}"#
+        let proposed = """
+        {"schema-version":1,"name":"X","build-settings":{
+          "OTHER_LDFLAGS": "-lz -lcurl",
+          "OTHER_LDFLAGS[config=Debug][config=Release]": "-lz -lcurl"
+        }}
+        """
+        let assessment = try assess(baseline, proposed)
+        let doublyQualified = assessment.violations.contains { violation in
+            guard case .settingChanged(_, let key, _, _)? = violation.change else { return false }
+            return key.conditions.count == 2
+        }
+        XCTAssertTrue(doublyQualified, "an unresolvable key must still be reported")
+    }
+
     /// When only a conditioned key moves there is no literal unconditioned finding
     /// to collapse, and the surviving finding must be the one that names Release.
     func testConditionedOverrideReportsTheAffectedConfiguration() throws {
@@ -381,12 +448,40 @@ final class PolicyEngineTests: XCTestCase {
     /// would produce matching output on both runs. Feeding the same project with
     /// its keys, targets and files written in a different order is what actually
     /// varies the dictionary insertion order.
-    func testViolationsAreOrderedBySeverityAndIndependentOfInputOrder() throws {
+    /// Severity ordering, asserted on a diff that actually produces all three.
+    ///
+    /// The supply-chain fixture alone yields only `.blocking` findings, and a list
+    /// where every element has the same severity is "sorted" under any permutation —
+    /// so an earlier version of this test stayed green with the `sorted` call in
+    /// `assess` deleted outright. This one crosses formats (for the advisory) and
+    /// drops the membership ceiling to zero (for the warning), so blocking, warning
+    /// and advisory are all present and their relative order is pinned.
+    func testViolationsAreOrderedBlockingThenWarningThenAdvisory() throws {
+        var policy = BuildGraphPolicy.baseline
+        policy.maximumMembershipChanges = 0
+
+        let legacy = try PbxprojBridge.decode(SampleProjects.storefrontLegacy)
+        let hostile = try graph(SampleProjects.storefrontSupplyChainEdit)
+        let assessment = PolicyEngine(policy: policy).assess(
+            GraphDiffer.diff(baseline: legacy, proposed: hostile)
+        )
+
+        let severities = assessment.violations.map(\.severity)
+        XCTAssertTrue(severities.contains(.blocking), "fixture must produce a blocking finding")
+        XCTAssertTrue(severities.contains(.warning), "fixture must produce a warning")
+        XCTAssertTrue(severities.contains(.advisory), "fixture must produce an advisory")
+        XCTAssertEqual(
+            severities, severities.sorted(by: >),
+            "findings must run blocking → warning → advisory, got \(severities.map(\.label))"
+        )
+        XCTAssertEqual(severities.last, .advisory)
+        XCTAssertEqual(severities.first, .blocking)
+    }
+
+    func testViolationOrderIsIndependentOfInputOrder() throws {
         let assessment = try assess(
             SampleProjects.storefrontBaseline, SampleProjects.storefrontSupplyChainEdit
         )
-        let severities = assessment.violations.map(\.severity)
-        XCTAssertEqual(severities, severities.sorted(by: >), "severities must be non-increasing")
         XCTAssertFalse(assessment.violations.isEmpty)
 
         let reordered = """
