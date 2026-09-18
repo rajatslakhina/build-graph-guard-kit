@@ -116,21 +116,29 @@ final class ReviewScenarioTests: XCTestCase {
         XCTAssertEqual(ProjectSource.pbxproj("{}").formatName, "project.pbxproj")
     }
 
-    /// Every `GraphDecodingError` must produce a sentence a human can act on; a
-    /// case added later without one would show up as an empty red row.
-    func testEveryDecodingErrorExplainsItself() {
-        let errors: [GraphDecodingError] = [
-            .notAnObject,
-            .missingField("x"),
-            .unsupportedSchemaVersion(found: 2, supported: 1...1),
-            .fileTreeTooDeep(limit: 64),
-            .fileTreeTooLarge(limit: 10),
-            .malformedNode(path: "p", reason: "r"),
-            .malformedPlist(reason: "r")
+    /// Every `GraphDecodingError` must produce a sentence a human can act on, and it
+    /// must name its own payload — the missing field, the offending limit, the path.
+    ///
+    /// Asserting only `count > 10` would pass for any fixed eleven-character string,
+    /// which is how "the gate said something" becomes indistinguishable from "the
+    /// gate said something useful".
+    func testEveryDecodingErrorNamesItsOwnPayload() {
+        let cases: [(GraphDecodingError, [String])] = [
+            (.notAnObject, ["JSON object"]),
+            (.missingField("schema-version"), ["schema-version"]),
+            (.unsupportedSchemaVersion(found: 99, supported: 1...1), ["99", "1"]),
+            (.fileTreeTooDeep(limit: 64), ["64"]),
+            (.fileTreeTooLarge(limit: 200_000), ["200000"]),
+            (.malformedNode(path: "files[3]", reason: "not an object"), ["files[3]", "not an object"]),
+            (.malformedPlist(reason: "unterminated string"), ["unterminated string"])
         ]
-        for error in errors {
-            XCTAssertFalse(error.explanation.isEmpty)
-            XCTAssertGreaterThan(error.explanation.count, 10)
+        for (error, expectedFragments) in cases {
+            for fragment in expectedFragments {
+                XCTAssertTrue(
+                    error.explanation.contains(fragment),
+                    "'\(error.explanation)' does not mention '\(fragment)'"
+                )
+            }
         }
     }
 }

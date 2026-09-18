@@ -235,21 +235,60 @@ final class JSONValueTests: XCTestCase {
         XCTAssertEqual(JSONValue.string("YES").settingValue, .boolean(true))
     }
 
-    /// `IPHONEOS_DEPLOYMENT_TARGET: 17.0` as a JSON number and `"17.0"` as a JSON
-    /// string are the same setting, and must canonicalise to the same value.
+    /// A version-valued setting written as a JSON **number** must canonicalise to the
+    /// same value as the same setting written as a JSON **string**.
     ///
-    /// An earlier version collapsed integral doubles to `Int`, so `17.0` became
-    /// `"17"` and diffed against `"17.0"` on every single run — exactly the
-    /// migration-day noise this library exists to suppress. The assertion below is
-    /// the regression test for that, which is why it compares against the string
-    /// spelling rather than against a hand-written expectation.
-    func testIntegralJSONNumbersKeepTheirDecimalSpelling() {
-        XCTAssertEqual(
-            JSONValue.number(17.0).settingValue,
-            SettingValue.string("17.0").canonicalized
-        )
+    /// This goes through `XcprojDecoder.decode` on purpose. A hand-built
+    /// `JSONValue.number(17.0)` proves nothing here, because the decoder never
+    /// produces one for that input: Foundation round-trips `17.0` through `Double`
+    /// and back losslessly, so JSON `17.0` arrives as `Int(17)` and the original
+    /// spelling is already gone. Two earlier attempts at this fix — collapsing
+    /// integral doubles to `Int`, then preserving the `Double` spelling — both failed
+    /// for that reason. The working fix is `SettingTable.canonicalized` stripping
+    /// trailing zeros for version-valued names, and only a decoder-level test can
+    /// tell you it works.
+    func testVersionSettingsCompareEqualAcrossJSONNumberAndStringSpellings() throws {
+        func floorValue(_ literal: String) throws -> SettingValue? {
+            let json = #"{"schema-version":1,"name":"X","build-settings":{"IPHONEOS_DEPLOYMENT_TARGET":\#(literal)}}"#
+            let data = try XCTUnwrap(json.data(using: .utf8))
+            let graph = GraphCanonicalizer.canonicalize(try XcprojDecoder.decode(data))
+            return graph.projectSettings[SettingKey(name: "IPHONEOS_DEPLOYMENT_TARGET")]
+        }
+
+        let asNumber = try floorValue("17.0")
+        let asString = try floorValue(#""17.0""#)
+        let asBareInt = try floorValue("17")
+        let asPatch = try floorValue(#""17.0.0""#)
+
+        XCTAssertNotNil(asNumber)
+        XCTAssertEqual(asNumber, asString, "a JSON number and string must not diff forever")
+        XCTAssertEqual(asString, asBareInt)
+        XCTAssertEqual(asBareInt, asPatch)
+
+        // A genuine version change must still be reported.
+        XCTAssertNotEqual(asString, try floorValue(#""15.0""#))
+        XCTAssertNotEqual(asString, try floorValue(#""17.4""#))
+    }
+
+    /// The narrowing matters: a marketing version is a display string, so `1.0.0`
+    /// and `1` are different edits and must not be collapsed.
+    func testNonVersionSettingsKeepTheirExactSpelling() throws {
+        func marketingValue(_ literal: String) throws -> SettingValue? {
+            let json = #"{"schema-version":1,"name":"X","build-settings":{"MARKETING_VERSION":\#(literal)}}"#
+            let data = try XCTUnwrap(json.data(using: .utf8))
+            return GraphCanonicalizer.canonicalize(try XcprojDecoder.decode(data))
+                .projectSettings[SettingKey(name: "MARKETING_VERSION")]
+        }
+        XCTAssertEqual(try marketingValue(#""1.0.0""#), .string("1.0.0"))
+        XCTAssertNotEqual(try marketingValue(#""1.0.0""#), try marketingValue(#""1""#))
+        XCTAssertFalse(SettingTable.isVersionValued(settingName: "MARKETING_VERSION"))
+        XCTAssertTrue(SettingTable.isVersionValued(settingName: "SWIFT_VERSION"))
+        XCTAssertTrue(SettingTable.isVersionValued(settingName: "IPHONEOS_DEPLOYMENT_TARGET"))
+        XCTAssertTrue(SettingTable.isVersionValued(settingName: "MACOSX_DEPLOYMENT_TARGET"))
+    }
+
+    func testNonIntegralNumbersStillRenderAsThemselves() {
         XCTAssertEqual(JSONValue.number(6.5).settingValue, .string("6.5"))
-        // A JSON integer has no decimal spelling to preserve.
         XCTAssertEqual(JSONValue.integer(17).settingValue, .string("17"))
     }
 }

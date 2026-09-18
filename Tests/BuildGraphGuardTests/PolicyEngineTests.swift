@@ -13,20 +13,40 @@ final class PolicyEngineTests: XCTestCase {
         .deletingLastPathComponent()   // Tests
         .deletingLastPathComponent()   // package root
 
+    /// The rule ids in a README table row's first cell.
+    ///
+    /// A row may document two related rules (`target.creation` / `target.removal`),
+    /// so the cell is stripped of backticks and split on `/` rather than parsed
+    /// positionally — which an earlier version got wrong, because whether the
+    /// odd-indexed pieces of a backtick split are the ids depends on whether the cell
+    /// has been trimmed first.
+    static func ruleIDs(inTableCell cell: String) -> [String] {
+        cell.replacingOccurrences(of: "`", with: "")
+            .split(separator: "/")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+    }
+
     /// Drives one real assessment per rule the engine can emit, and returns the
     /// ids that actually fired. Nothing is hardcoded: if a rule stops being
     /// reachable, its id disappears from this set and the README comparison fails.
     static func everyRuleIDReachableThroughRealAssessments() throws -> Set<String> {
+        Set(try everyFindingReachableThroughRealAssessments().map(\.ruleID))
+    }
+
+    /// Same sweep, keeping the severity each rule actually fires at, so the README's
+    /// Severity column can be checked as well as its rule ids.
+    static func everyFindingReachableThroughRealAssessments() throws -> [PolicyViolation] {
         func decode(_ json: String) throws -> ProjectGraph {
             try XcprojDecoder.decode(XCTUnwrap(json.data(using: .utf8)))
         }
-        func ids(
+        func findings(
             _ baseline: String, _ proposed: String, policy: BuildGraphPolicy = .baseline
-        ) throws -> [String] {
+        ) throws -> [PolicyViolation] {
             let diff = GraphDiffer.diff(
                 baseline: try decode(baseline), proposed: try decode(proposed)
             )
-            return PolicyEngine(policy: policy).assess(diff).violations.map(\.ruleID)
+            return PolicyEngine(policy: policy).assess(diff).violations
         }
 
         let empty = #"{"schema-version":1,"name":"X"}"#
@@ -58,18 +78,18 @@ final class PolicyEngineTests: XCTestCase {
         var lowCeiling = BuildGraphPolicy.baseline
         lowCeiling.maximumMembershipChanges = 1
 
-        var observed: Set<String> = []
+        var observed: [PolicyViolation] = []
         for sample in ReviewScenario.samples {
-            observed.formUnion(try sample.assess().violations.map(\.ruleID))
+            observed.append(contentsOf: try sample.assess().violations)
         }
-        observed.formUnion(try ids(floor17, floorInherited))
-        observed.formUnion(try ids(floor17, floor9, policy: brokenFloor))
-        observed.formUnion(try ids(oneTarget, retypedTarget, policy: frozenTarget))
-        observed.formUnion(try ids(empty, oneTarget, policy: noCreation))
-        observed.formUnion(try ids(oneTarget, empty))
-        observed.formUnion(try ids(oneTarget, retypedTarget))
-        observed.formUnion(try ids(pinned, bumped, policy: frozenPins))
-        observed.formUnion(try ids(oneTarget, manyFiles, policy: lowCeiling))
+        observed.append(contentsOf: try findings(floor17, floorInherited))
+        observed.append(contentsOf: try findings(floor17, floor9, policy: brokenFloor))
+        observed.append(contentsOf: try findings(oneTarget, retypedTarget, policy: frozenTarget))
+        observed.append(contentsOf: try findings(empty, oneTarget, policy: noCreation))
+        observed.append(contentsOf: try findings(oneTarget, empty))
+        observed.append(contentsOf: try findings(oneTarget, retypedTarget))
+        observed.append(contentsOf: try findings(pinned, bumped, policy: frozenPins))
+        observed.append(contentsOf: try findings(oneTarget, manyFiles, policy: lowCeiling))
         return observed
     }
 
@@ -372,6 +392,36 @@ final class PolicyEngineTests: XCTestCase {
         XCTAssertEqual(try assess(baseline, proposed, policy: permissive).verdict, .clean)
     }
 
+    /// Removing a target must report the membership it takes with it.
+    ///
+    /// The differ used to emit `.targetRemoved` and nothing else, so under a policy
+    /// permitting removal, deleting a target that compiled four thousand files
+    /// produced exactly one change: no membership edits, 0% churn, no volume warning,
+    /// verdict `.clean`. The largest possible edit to a build graph was the quietest.
+    func testRemovingATargetReportsTheMembershipItTakesWithIt() throws {
+        let files = (0..<5).map { #"{"path":"f\#($0).swift","target-membership":["T"]}"# }
+        let baseline = #"{"schema-version":1,"name":"X","targets":[{"name":"T","product-type":"p","package-product-dependencies":["Lib"]}],"files":["#
+            + files.joined(separator: ",") + "]}"
+        let proposed = #"{"schema-version":1,"name":"X"}"#
+
+        var permissive = BuildGraphPolicy.baseline
+        permissive.allowTargetRemoval = true
+        permissive.maximumMembershipChanges = 2
+
+        let assessment = try assess(baseline, proposed, policy: permissive)
+
+        XCTAssertEqual(assessment.diff.baselineMembershipCount, 5)
+        XCTAssertEqual(assessment.diff.membershipChurnPercentage, 100)
+        XCTAssertTrue(
+            assessment.diff.changes.contains(.membershipRemoved(target: "T", path: "f0.swift"))
+        )
+        XCTAssertTrue(
+            assessment.diff.changes.contains(.packageProductUnlinked(target: "T", product: "Lib"))
+        )
+        XCTAssertEqual(assessment.verdict, .needsReview, "the volume ceiling must fire")
+        XCTAssertTrue(assessment.warnings.contains { $0.ruleID == "volume.membership" })
+    }
+
     func testProductTypeChangeIsAlwaysBlocking() throws {
         let baseline = #"{"schema-version":1,"name":"X","targets":[{"name":"T","product-type":"com.apple.product-type.bundle.unit-test"}]}"#
         let proposed = #"{"schema-version":1,"name":"X","targets":[{"name":"T","product-type":"com.apple.product-type.application"}]}"#
@@ -439,45 +489,90 @@ final class PolicyEngineTests: XCTestCase {
 
     // MARK: - Ordering and policy round-trip
 
+    /// Severity ordering, on a fixture where the sort has to do real work.
+    ///
+    /// Two earlier versions of this test were satisfied by deleting the `sorted` call
+    /// from `assess` outright. The first used a fixture producing only `.blocking`
+    /// findings — a list of equal elements is "sorted" under any permutation. The
+    /// second added a warning and an advisory but happened to *construct* them last
+    /// (`assess` appends change-derived findings, then the volume warning, then the
+    /// cross-format advisory), so the unsorted order was already descending.
+    ///
+    /// This fixture puts a **warning before a blocking finding in construction
+    /// order**: the unreadable deployment target on target `AAA` is emitted by
+    /// `targetChanges`, which runs first, while the package re-point is emitted by
+    /// `packageChanges`, which runs last. Remove the sort and this fails on
+    /// `[warning, blocking]`.
+    func testViolationsAreOrderedBlockingThenWarningThenAdvisory() throws {
+        let baseline = """
+        {"schema-version":1,"name":"X",
+         "targets":[{"name":"AAA","product-type":"a",
+                     "build-settings":{"IPHONEOS_DEPLOYMENT_TARGET":"17.0"}}],
+         "package-dependencies":[{"url":"https://github.com/o/k.git",
+           "requirement":{"kind":"upToNextMajorVersion","minimum-version":"1.0.0"}}]}
+        """
+        let proposed = """
+        {"schema-version":1,"name":"X",
+         "targets":[{"name":"AAA","product-type":"a",
+                     "build-settings":{"IPHONEOS_DEPLOYMENT_TARGET":"$(INHERITED)"}}],
+         "package-dependencies":[{"url":"https://github.com/evil/k.git",
+           "requirement":{"kind":"upToNextMajorVersion","minimum-version":"1.0.0"}}]}
+        """
+        let assessment = try assess(baseline, proposed)
+        let severities = assessment.violations.map(\.severity)
+
+        XCTAssertTrue(severities.contains(.blocking), "fixture must produce a blocking finding")
+        XCTAssertTrue(severities.contains(.warning), "fixture must produce a warning")
+        XCTAssertEqual(
+            severities, severities.sorted(by: >),
+            "findings must run blocking → warning, got \(severities.map(\.label))"
+        )
+        XCTAssertEqual(severities.first, .blocking)
+        XCTAssertEqual(severities.last, .warning)
+
+        // And an advisory really does sort to the very end, on a cross-format diff.
+        var strict = BuildGraphPolicy.baseline
+        strict.maximumMembershipChanges = 0
+        let legacy = try PbxprojBridge.decode(SampleProjects.storefrontLegacy)
+        let hostile = try graph(SampleProjects.storefrontSupplyChainEdit)
+        let crossFormat = PolicyEngine(policy: strict).assess(
+            GraphDiffer.diff(baseline: legacy, proposed: hostile)
+        )
+        let crossSeverities = crossFormat.violations.map(\.severity)
+        XCTAssertTrue(crossSeverities.contains(.advisory))
+        XCTAssertEqual(crossSeverities, crossSeverities.sorted(by: >))
+        XCTAssertEqual(crossSeverities.last, .advisory)
+    }
+
+    /// The secondary sort keys — `ruleID` ascending, then the change summary — are
+    /// what make the report stable enough to diff between runs. Flip either
+    /// comparator and this fails.
+    func testFindingsOfEqualSeverityAreOrderedByRuleThenSummary() throws {
+        let assessment = try assess(
+            SampleProjects.storefrontBaseline, SampleProjects.storefrontSupplyChainEdit
+        )
+        let blocking = assessment.blockingViolations
+        XCTAssertGreaterThan(blocking.count, 2)
+
+        let ruleIDs = blocking.map(\.ruleID)
+        XCTAssertEqual(ruleIDs, ruleIDs.sorted(), "equal severities sort by ruleID ascending")
+
+        for rule in Set(ruleIDs) {
+            let summaries = blocking
+                .filter { $0.ruleID == rule }
+                .map { $0.change?.summary ?? "" }
+            XCTAssertEqual(summaries, summaries.sorted(), "within a rule, sort by summary")
+        }
+    }
+
     /// Ordering must not depend on the order the *input file* happened to list
     /// things in.
     ///
-    /// Running the same assessment twice in one process proves nothing: Swift's
-    /// hash seed is fixed per process, so two dictionaries built by the same code
-    /// path with the same data iterate identically, and a genuine ordering leak
-    /// would produce matching output on both runs. Feeding the same project with
-    /// its keys, targets and files written in a different order is what actually
-    /// varies the dictionary insertion order.
-    /// Severity ordering, asserted on a diff that actually produces all three.
-    ///
-    /// The supply-chain fixture alone yields only `.blocking` findings, and a list
-    /// where every element has the same severity is "sorted" under any permutation —
-    /// so an earlier version of this test stayed green with the `sorted` call in
-    /// `assess` deleted outright. This one crosses formats (for the advisory) and
-    /// drops the membership ceiling to zero (for the warning), so blocking, warning
-    /// and advisory are all present and their relative order is pinned.
-    func testViolationsAreOrderedBlockingThenWarningThenAdvisory() throws {
-        var policy = BuildGraphPolicy.baseline
-        policy.maximumMembershipChanges = 0
-
-        let legacy = try PbxprojBridge.decode(SampleProjects.storefrontLegacy)
-        let hostile = try graph(SampleProjects.storefrontSupplyChainEdit)
-        let assessment = PolicyEngine(policy: policy).assess(
-            GraphDiffer.diff(baseline: legacy, proposed: hostile)
-        )
-
-        let severities = assessment.violations.map(\.severity)
-        XCTAssertTrue(severities.contains(.blocking), "fixture must produce a blocking finding")
-        XCTAssertTrue(severities.contains(.warning), "fixture must produce a warning")
-        XCTAssertTrue(severities.contains(.advisory), "fixture must produce an advisory")
-        XCTAssertEqual(
-            severities, severities.sorted(by: >),
-            "findings must run blocking → warning → advisory, got \(severities.map(\.label))"
-        )
-        XCTAssertEqual(severities.last, .advisory)
-        XCTAssertEqual(severities.first, .blocking)
-    }
-
+    /// Running the same assessment twice in one process proves little: Swift's hash
+    /// seed is fixed per process, so two dictionaries built by the same code path
+    /// with the same data iterate identically. Feeding the same project with its
+    /// keys, targets and files written in a different order is what actually varies
+    /// the dictionary insertion order the pipeline has to normalise away.
     func testViolationOrderIsIndependentOfInputOrder() throws {
         let assessment = try assess(
             SampleProjects.storefrontBaseline, SampleProjects.storefrontSupplyChainEdit
@@ -566,12 +661,22 @@ final class PolicyEngineTests: XCTestCase {
     /// is hash-seeded, so without explicit sorting a policy re-encoded in another
     /// process produces different bytes — reordering noise, in a tool whose thesis
     /// is that reordering noise hides real change.
-    func testPolicyEncodingIsStableAcrossSetOrdering() throws {
-        var shuffled = BuildGraphPolicy.baseline
-        shuffled.frozenSettingNames = Set(BuildGraphPolicy.baseline.frozenSettingNames.shuffled())
-        shuffled.frozenSettingPrefixes = Set(BuildGraphPolicy.baseline.frozenSettingPrefixes.shuffled())
-        XCTAssertEqual(shuffled, .baseline)
-        XCTAssertEqual(try shuffled.encoded(), try BuildGraphPolicy.baseline.encoded())
+    /// Asserts the emitted arrays are *sorted*, not merely that two in-process
+    /// encodings agree — which they would even without the `.sorted()` calls, since
+    /// one process has one hash seed.
+    func testPolicyEncodingEmitsSortedArrays() throws {
+        let json = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: try BuildGraphPolicy.baseline.encoded())
+                as? [String: Any]
+        )
+        for field in ["frozenSettingNames", "frozenSettingPrefixes", "frozenTargets"] {
+            let array = try XCTUnwrap(json[field] as? [String], "missing \(field)")
+            XCTAssertEqual(array, array.sorted(), "\(field) must be emitted in sorted order")
+        }
+        XCTAssertEqual(
+            try XCTUnwrap(json["frozenSettingNames"] as? [String]),
+            BuildGraphPolicy.baseline.frozenSettingNames.sorted()
+        )
     }
 
     /// The README lists every rule id in a table. A rule the engine can emit but the
@@ -601,14 +706,10 @@ final class PolicyEngineTests: XCTestCase {
                 break
             }
             guard insideRuleTable, line.hasPrefix("| `") else { continue }
-            // Take every backticked token in the row's first cell, so a row that
-            // documents two related rules (`target.creation` / `target.removal`)
-            // contributes both rather than only the first.
-            guard let firstCellEnd = line.dropFirst().firstIndex(of: "|") else { continue }
-            let cell = line[line.startIndex..<firstCellEnd]
-            for token in cell.split(separator: "`").enumerated() where token.offset % 2 == 1 {
-                documented.insert(String(token.element).trimmingCharacters(in: .whitespaces))
-            }
+            let cells = line.split(separator: "|", omittingEmptySubsequences: false)
+                .map { $0.trimmingCharacters(in: .whitespaces) }
+            guard cells.count >= 2 else { continue }
+            documented.formUnion(Self.ruleIDs(inTableCell: cells[1]))
         }
         XCTAssertTrue(insideRuleTable, "README.md no longer has a '### Rules' section")
         XCTAssertFalse(documented.isEmpty, "could not parse the rule table out of README.md")
@@ -622,6 +723,50 @@ final class PolicyEngineTests: XCTestCase {
             Only in the README: \(documented.subtracting(observed).sorted())
             """
         )
+    }
+
+    /// The Severity column too, not just the rule ids.
+    ///
+    /// Comparing ids alone leaves the second cell unverified by construction: change
+    /// `volume.membership` from `.warning` to `.blocking` and the table is wrong with
+    /// nothing red. This parses the severity out of each row and compares it against
+    /// the severity the rule actually fires at.
+    func testReadmeRuleTableSeveritiesMatchTheEngine() throws {
+        let readme = try String(
+            contentsOf: Self.repositoryRoot.appendingPathComponent("README.md"),
+            encoding: .utf8
+        )
+        var documented: [String: String] = [:]
+        var insideRuleTable = false
+        for line in readme.split(separator: "\n", omittingEmptySubsequences: false) {
+            if line.hasPrefix("### Rules") { insideRuleTable = true; continue }
+            if insideRuleTable, line.hasPrefix("#") || line.hasPrefix("---") { break }
+            guard insideRuleTable, line.hasPrefix("| `") else { continue }
+            let cells = line.split(separator: "|", omittingEmptySubsequences: false)
+                .map { $0.trimmingCharacters(in: .whitespaces) }
+            guard cells.count >= 3 else { continue }
+            let severity = cells[2]
+            for rule in Self.ruleIDs(inTableCell: cells[1]) {
+                documented[rule] = severity
+            }
+        }
+        XCTAssertFalse(documented.isEmpty)
+
+        var actual: [String: Set<String>] = [:]
+        for finding in try Self.everyFindingReachableThroughRealAssessments() {
+            actual[finding.ruleID, default: []].insert(finding.severity.label)
+        }
+
+        for (rule, severities) in actual {
+            XCTAssertEqual(
+                severities.count, 1,
+                "'\(rule)' fires at more than one severity: \(severities.sorted())"
+            )
+            XCTAssertEqual(
+                documented[rule], severities.first,
+                "README says '\(rule)' is \(documented[rule] ?? "absent"), engine emits \(severities.first ?? "?")"
+            )
+        }
     }
 
     func testFrozenPrefixMatchingIsPrefixNotSubstring() {
@@ -654,7 +799,7 @@ final class RiskScorerTests: XCTestCase {
         XCTAssertEqual(RiskScorer.band(0), "None")
     }
 
-    func testScoreIsClampedAndNeverOverflows() {
+    func testScoreIsClamped() {
         let many = Array(
             repeating: GraphChange.targetRemoved(name: "T", productType: "p"), count: 100_000
         )

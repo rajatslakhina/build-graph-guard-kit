@@ -70,7 +70,7 @@ final class OpenStepPlistTests: XCTestCase {
     /// fixture is `/`, which is a perfectly legal *bare token* in the OpenStep
     /// dialect, so demanding that the scanner reject it would be demanding wrong
     /// behaviour. What must never happen is that a truncated file yields a usable
-    /// build graph — that is what this asserts, for all ~5,000 prefixes.
+    /// build graph — that is what this asserts, for all 6,055 prefixes.
     ///
     /// An earlier draft wrote `_ = try? OpenStepPlist.parse(prefix)` with no
     /// assertion at all; a `parse` gutted to `return .string("")` would have kept it
@@ -132,8 +132,11 @@ final class PbxprojBridgeTests: XCTestCase {
     func testUniformSettingsAreHoistedAndNonUniformOnesAreNot() throws {
         let graph = try PbxprojBridge.decode(SampleProjects.storefrontLegacy)
 
+        // `6`, not `6.0`: `SWIFT_VERSION` is version-valued, so canonicalisation
+        // strips trailing zeros (see `SettingTable.isVersionValued`). That is what
+        // lets the legacy file's `6.0` and a JSON file's bare `6` compare equal.
         XCTAssertEqual(
-            graph.projectSettings[SettingKey(name: "SWIFT_VERSION")], .string("6.0")
+            graph.projectSettings[SettingKey(name: "SWIFT_VERSION")], .string("6")
         )
         XCTAssertNil(
             graph.projectSettings[
